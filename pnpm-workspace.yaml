@@ -1,0 +1,4 @@
+# pnpm refuses an install until every package with an install script is answered here.
+# esbuild (via tsup) unpacks its platform binary in its script.
+allowBuilds:
+  esbuild: true
