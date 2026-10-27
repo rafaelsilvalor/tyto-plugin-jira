@@ -1,0 +1,27 @@
+name: ci
+on:
+  pull_request:
+  push: { branches: [main] }
+concurrency: { group: 'ci-${{ github.ref }}', cancel-in-progress: true }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+      # Tyto installs this folder as it is and never builds it, so the committed bundle must be
+      # exactly what `src/` builds to. `git status` rather than `git diff` alone, so a file the
+      # build adds and nobody committed fails too.
+      - name: dist is what src builds to
+        run: |
+          git status --porcelain dist
+          git diff --exit-code dist
+          test -z "$(git status --porcelain dist)"
