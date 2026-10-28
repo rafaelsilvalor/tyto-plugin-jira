@@ -54,7 +54,22 @@ is plain text people paste into bug reports, and the project file is shared by a
 ## Development
 
 `pnpm check` runs Prettier, the type checker, ESLint and the tests; `pnpm build` writes
-`dist/index.js`, which is committed and which CI rebuilds and compares. `@tyto/plugin-api` is
-not on npm, so the types this plugin uses are copied into `src/tyto-api.d.ts`, and Tyto's
-manifest and setting checks into `tests/tyto-schemas.ts`, each naming the Tyto commit it came
-from.
+`dist/index.js`, which is committed and which CI rebuilds and compares.
+
+The plugin depends on Tyto's published contract, `@tyto/plugin-api`, which GitHub Packages
+holds as `@rafaelsilvalor/tyto-plugin-api` (Tyto ADR 0149); `package.json` aliases it, so the
+code imports `@tyto/plugin-api`. Installing it needs a GitHub token with `read:packages`, and
+pnpm reads that token only from your user-level `~/.npmrc`, never from the committed one:
+
+```sh
+gh auth refresh -s read:packages
+echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' >> ~/.npmrc
+NODE_AUTH_TOKEN=$(gh auth token) pnpm install
+```
+
+The plugin imports only types from it, so the bundle does not change. The tests run the committed `dist/index.js` through the contract's own
+harness, `@tyto/plugin-api/testing` (Tyto ADR 0150): build before you test.
+
+The `contract` workflow runs every Monday, and on demand, against the newest published
+contract rather than the range in `package.json`: a red run there is a Tyto release this plugin
+does not yet work with.

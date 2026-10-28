@@ -3,19 +3,29 @@ on:
   pull_request:
   push: { branches: [main] }
 concurrency: { group: 'ci-${{ github.ref }}', cancel-in-progress: true }
+# The contract (`@tyto/plugin-api`) is read from GitHub Packages with the workflow's own token.
+permissions:
+  contents: read
+  packages: read
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
-        with: { node-version: 24, cache: pnpm }
+        # Writes the scope and `${NODE_AUTH_TOKEN}` into a user-level .npmrc, which pnpm reads.
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://npm.pkg.github.com
+          scope: '@rafaelsilvalor'
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
       - run: pnpm typecheck
       - run: pnpm lint
-      - run: pnpm test
       - run: pnpm build
       # Tyto installs this folder as it is and never builds it, so the committed bundle must be
       # exactly what `src/` builds to. `git status` rather than `git diff` alone, so a file the
@@ -25,3 +35,5 @@ jobs:
           git status --porcelain dist
           git diff --exit-code dist
           test -z "$(git status --porcelain dist)"
+      # After the build: the tests load dist/index.js through the contract's harness.
+      - run: pnpm test
