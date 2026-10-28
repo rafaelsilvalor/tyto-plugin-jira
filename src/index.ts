@@ -1,5 +1,6 @@
+import type { Disposable, PluginHost } from '@tyto/plugin-api';
+
 import { SETTINGS } from './settings.js';
-import type { Disposable, PluginHost } from './tyto-api.js';
 
 /**
  * Declares the plugin's settings and nothing else yet.

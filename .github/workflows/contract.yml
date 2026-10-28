@@ -1,0 +1,34 @@
+name: contract
+# Installs the newest published Tyto contract, past the caret range package.json asks for, and
+# runs the tests against it, so a Tyto release that breaks this plugin turns this red before a
+# person installs it. A red run here is a warning, not a broken main: move the range and the
+# manifest's engine together when the new contract is the one to build against.
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: read
+jobs:
+  newest-contract:
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        # Writes the scope and `${NODE_AUTH_TOKEN}` into a user-level .npmrc, which pnpm reads.
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://npm.pkg.github.com
+          scope: '@rafaelsilvalor'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm add --save-dev '@tyto/plugin-api@npm:@rafaelsilvalor/tyto-plugin-api@latest'
+      - name: installed contract
+        run: node -p "'@tyto/plugin-api ' + require('./node_modules/@tyto/plugin-api/package.json').version"
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test

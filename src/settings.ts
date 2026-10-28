@@ -1,4 +1,4 @@
-import type { FormConfigurationContribution } from './tyto-api.js';
+import type { FormConfigurationContribution } from '@tyto/plugin-api';
 
 /**
  * The plugin's settings, which the person writes in the desktop's `settings.json` as

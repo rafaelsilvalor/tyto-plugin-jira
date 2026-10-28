@@ -2,3 +2,7 @@
 # esbuild (via tsup) unpacks its platform binary in its script.
 allowBuilds:
   esbuild: true
+# Tyto's contract is this owner's own package, and the contract workflow installs a release the
+# day it is published: the release-age wait guards against somebody else's package.
+minimumReleaseAgeExclude:
+  - '@rafaelsilvalor/*'
