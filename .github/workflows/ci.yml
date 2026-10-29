@@ -2,6 +2,8 @@ name: ci
 on:
   pull_request:
   push: { branches: [main] }
+  # The contract workflow dispatches this on the pull request it opens (Tyto ADR 0154).
+  workflow_dispatch:
 concurrency: { group: 'ci-${{ github.ref }}', cancel-in-progress: true }
 # The contract (`@tyto/plugin-api`) is read from GitHub Packages with the workflow's own token.
 permissions:
