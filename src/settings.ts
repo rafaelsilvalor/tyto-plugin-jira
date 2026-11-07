@@ -11,7 +11,7 @@ import type { FormConfigurationContribution } from '@tyto/plugin-api';
  * belongs in the shared `jira` section of `.tyto/project.json`: that file is one team's, and an
  * email is one person's.
  *
- * Read by nothing yet: the HTTP client that uses them is the next pull request.
+ * Read by `resolveJiraConfig` (`config.ts`), through `host.config`.
  */
 export const SETTINGS: readonly FormConfigurationContribution[] = [
   {
