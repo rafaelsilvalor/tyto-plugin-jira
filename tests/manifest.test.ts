@@ -55,13 +55,27 @@ describe('tyto-plugin.json', () => {
 });
 
 describe('activate', () => {
-  it('declares two settings with no default, and no verb yet', async () => {
+  it('declares two settings with no default, and the jira.pull source', async () => {
     const plugin = await harness();
     const declared = plugin.host.registry.configurations();
     expect(declared.map((setting) => setting.key)).toEqual(['jira.baseUrl', 'jira.email']);
     expect(plugin.settings.values).toEqual({ 'jira.baseUrl': null, 'jira.email': null });
     expect(plugin.settings.diagnostics).toEqual([]);
-    expect(plugin.host.registry.recipeVerbs()).toEqual([]);
+    expect(
+      plugin.host.registry.recipeVerbs().map((verb) => [verb.id, verb.kind, verb.arguments]),
+    ).toEqual([
+      [
+        'jira.pull',
+        'source',
+        [
+          { name: 'jql', type: 'text' },
+          { name: 'board', type: 'number' },
+          { name: 'keys', type: 'text' },
+          { name: 'parent', type: 'text' },
+          { name: 'max', type: 'number' },
+        ],
+      ],
+    ]);
     await plugin.close();
   });
 
@@ -76,7 +90,7 @@ describe('activate', () => {
     await refused.close();
   });
 
-  it('withdraws every setting when disposed', () => {
+  it('withdraws every setting and the verb when disposed', () => {
     const host = createPluginHost();
     let registered: Disposable | undefined;
     const activated = host.tryActivate({
@@ -89,7 +103,9 @@ describe('activate', () => {
     });
     expect(activated.ok).toBe(true);
     expect(host.registry.configurations()).toHaveLength(2);
+    expect(host.registry.recipeVerbs()).toHaveLength(1);
     registered?.dispose();
     expect(host.registry.configurations()).toEqual([]);
+    expect(host.registry.recipeVerbs()).toEqual([]);
   });
 });

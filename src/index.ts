@@ -1,16 +1,20 @@
 import type { Disposable, PluginHost } from '@tyto/plugin-api';
 
+import { pullVerb } from './pull.js';
 import { SETTINGS } from './settings.js';
 
 /**
- * Declares the plugin's settings and nothing else yet.
+ * Declares the plugin's settings and its one recipe verb, `jira.pull`.
  *
- * The `jira` namespace and the `net:*.atlassian.net` permission are in `tyto-plugin.json` for
- * the verbs that come next (`jira.pull`, then `jira.refresh`); until they exist this plugin
- * makes no request and reads no secret.
+ * Nothing is read at activation: the site, the email and the token are resolved on every call
+ * of the verb, from the section the call carries, so a folder or a credential changed between
+ * two runs is what the next run uses.
  */
 export function activate(host: PluginHost): Disposable {
-  const registered = SETTINGS.map((setting) => host.registerConfiguration(setting));
+  const registered = [
+    ...SETTINGS.map((setting) => host.registerConfiguration(setting)),
+    host.registerRecipeVerb(pullVerb(host)),
+  ];
   return {
     dispose() {
       for (const registration of registered) registration.dispose();
