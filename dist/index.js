@@ -17,6 +17,143 @@ function messageOf(thrown) {
   return thrown instanceof Error ? thrown.message : String(thrown);
 }
 
+// src/config.ts
+var RAW_RECORD = {
+  safeParse: (value) => ({ success: true, data: value })
+};
+var CLOUD_DOMAIN = ".atlassian.net";
+var NOT_CLOUD = "Only Jira Cloud on <site>.atlassian.net is supported. Jira Data Center and Server, and a Cloud site on a custom domain, are out: the plugin may reach only *.atlassian.net.";
+async function resolveJiraConfig(host, section) {
+  const settings = readSettings(host);
+  const sectionSite = siteInSection(section);
+  if (!sectionSite.ok) return sectionSite;
+  const written = sectionSite.value ?? settings.baseUrl;
+  if (written === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No Jira site is set. Write it as baseUrl in the jira section of .tyto/project.json, or as jira.baseUrl in settings.json, such as https://example.atlassian.net."
+    );
+  }
+  const baseUrl = cloudOrigin(written);
+  if (!baseUrl.ok) return baseUrl;
+  const token = await readCredential(host, "api-token");
+  if (!token.ok) return token;
+  if (token.value === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No Jira API token is stored. Store it as the api-token credential (TYTO_PLUGIN_JIRA_API_TOKEN on the command line, the keychain in the desktop).",
+      { hostCode: "E_CREDENTIAL_MISSING" }
+    );
+  }
+  const storedEmail = await readCredential(host, "email");
+  if (!storedEmail.ok) return storedEmail;
+  const email = storedEmail.value ?? settings.email;
+  if (email === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No email for the Jira API token. Store it as the email credential (TYTO_PLUGIN_JIRA_EMAIL on the command line), or write it as jira.email in settings.json.",
+      { hostCode: "E_CREDENTIAL_MISSING" }
+    );
+  }
+  return jiraOk({ baseUrl: baseUrl.value, email, token: token.value });
+}
+function cloudOrigin(written) {
+  let url;
+  try {
+    url = new URL(written.trim());
+  } catch {
+    return jiraError("E_JIRA_CONFIG", `'${written}' is not a URL. ${NOT_CLOUD}`);
+  }
+  if (url.protocol !== "https:") {
+    return jiraError("E_JIRA_CONFIG", `'${written}' is not https. ${NOT_CLOUD}`);
+  }
+  const site = url.hostname.slice(0, -CLOUD_DOMAIN.length);
+  if (!url.hostname.endsWith(CLOUD_DOMAIN) || site.length === 0 || site.includes(".")) {
+    return jiraError("E_JIRA_CONFIG", `'${url.hostname}' is not a Jira Cloud site. ${NOT_CLOUD}`);
+  }
+  if (url.port !== "" || url.username !== "" || url.password !== "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `'${written}' carries a port or a user name; write the site alone, such as https://${url.hostname}.`
+    );
+  }
+  if (url.pathname !== "/" && url.pathname !== "" || url.search !== "" || url.hash !== "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `'${written}' carries a path; write the site alone, such as https://${url.hostname}.`
+    );
+  }
+  return jiraOk(url.origin);
+}
+function readSettings(host) {
+  const raw = host.config(RAW_RECORD);
+  if (typeof raw !== "object" || raw === null) return {};
+  const record2 = raw;
+  const baseUrl = nonEmptyString(record2["baseUrl"]);
+  const email = nonEmptyString(record2["email"]);
+  return {
+    ...baseUrl === void 0 ? {} : { baseUrl },
+    ...email === void 0 ? {} : { email }
+  };
+}
+function siteInSection(section) {
+  if (section === void 0 || section === null) return jiraOk(void 0);
+  if (typeof section !== "object" || Array.isArray(section)) {
+    return jiraError("E_JIRA_CONFIG", "The jira section of .tyto/project.json is not an object.");
+  }
+  const value = section["baseUrl"];
+  if (value === void 0 || value === null) return jiraOk(void 0);
+  if (typeof value !== "string" || value.trim() === "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "baseUrl in the jira section of .tyto/project.json is not a URL, such as https://example.atlassian.net."
+    );
+  }
+  return jiraOk(value);
+}
+async function readCredential(host, key) {
+  try {
+    return jiraOk(nonEmptyString(await host.credentials(key)));
+  } catch (thrown) {
+    const hostCode = hostCodeOf(thrown);
+    if (hostCode === "E_CREDENTIAL_MISSING") return jiraOk(void 0);
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `Tyto could not read the ${key} credential: ${messageOf(thrown)}`,
+      hostCode === void 0 ? {} : { hostCode }
+    );
+  }
+}
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
+}
+
+// src/diagnostics.ts
+var VERB_ID = "jira.pull";
+var REFRESH_VERB_ID = "jira.refresh";
+var TRANSITION_VERB_ID = "jira.transition";
+var ASSIGN_VERB_ID = "jira.assign";
+function verbFailed(error, verb = VERB_ID) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_VERB",
+    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
+  };
+}
+function argumentsProblem(problem4, verb = VERB_ID) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_ARGUMENTS",
+    message: `'${verb}' ${withoutFinalStop(problem4)}.`
+  };
+}
+function failed(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function withoutFinalStop(text2) {
+  return text2.trim().replace(/\.+$/, "");
+}
+
 // src/columns.ts
 var ORIGIN = "jira";
 var FIXED_COLUMNS = [
@@ -335,6 +472,162 @@ function base64(text2) {
   return encoded;
 }
 
+// src/search.ts
+var PAGE_SIZE = 50;
+var COMMENT_PAGE_SIZE = 100;
+var SEARCH_PATH = "/rest/api/3/search/jql";
+async function jqlOf(client, selector) {
+  switch (selector.kind) {
+    case "jql":
+      return jiraOk(selector.jql);
+    case "keys":
+      return jiraOk(`key in (${selector.keys.join(", ")})`);
+    case "parent":
+      return jiraOk(`parent = ${selector.key}`);
+    case "board":
+      return boardJql(client, selector.board);
+  }
+}
+async function boardJql(client, board) {
+  const configuration = await client.get(`/rest/agile/1.0/board/${board}/configuration`);
+  if (!configuration.ok) return configuration;
+  const filterId = record(record(configuration.value)?.["filter"])?.["id"];
+  if (typeof filterId !== "string" && typeof filterId !== "number") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `board ${board} has no saved filter, so there is no JQL to pull it by. Pull its project with jql= instead.`
+    );
+  }
+  const filter = await client.get(`/rest/api/3/filter/${encodeURIComponent(String(filterId))}`);
+  if (!filter.ok) return filter;
+  const jql = record(filter.value)?.["jql"];
+  if (typeof jql !== "string" || jql.trim() === "") {
+    return jiraError(
+      "E_JIRA_RESPONSE",
+      `filter ${String(filterId)} of board ${board} answered no JQL.`
+    );
+  }
+  return jiraOk(jql);
+}
+async function searchPage(client, jql, fields, token) {
+  const answer = await client.post(SEARCH_PATH, {
+    jql,
+    fields,
+    maxResults: PAGE_SIZE,
+    ...token === void 0 ? {} : { nextPageToken: token }
+  });
+  if (!answer.ok) return answer;
+  const body = record(answer.value);
+  const issues = body?.["issues"];
+  if (body === void 0 || !Array.isArray(issues)) {
+    return shapeError(`POST ${SEARCH_PATH} answered no issues list`);
+  }
+  const pulled = [];
+  for (const issue of issues) {
+    const checked = issueOf(issue);
+    if (checked === void 0) {
+      return shapeError(`POST ${SEARCH_PATH} answered an issue without an id, a key or fields`);
+    }
+    pulled.push(checked);
+  }
+  const next = body["nextPageToken"];
+  if (next !== void 0 && next !== null && (typeof next !== "string" || next === "")) {
+    return shapeError(`POST ${SEARCH_PATH} answered a nextPageToken that is not text`);
+  }
+  const nextPageToken = typeof next === "string" ? next : void 0;
+  const isLast = body["isLast"];
+  if (isLast !== void 0 && typeof isLast !== "boolean") {
+    return shapeError(`POST ${SEARCH_PATH} answered an isLast that is not true or false`);
+  }
+  return jiraOk({
+    issues: pulled,
+    ...nextPageToken === void 0 ? {} : { nextPageToken },
+    isLast: isLast ?? nextPageToken === void 0
+  });
+}
+async function commentBodies(client, issue) {
+  const embedded = record(issue.fields["comment"]);
+  const comments = Array.isArray(embedded?.["comments"]) ? embedded["comments"] : [];
+  const total = embedded?.["total"];
+  if (typeof total !== "number" || total <= comments.length) {
+    return jiraOk(comments.map((comment) => record(comment)?.["body"]));
+  }
+  const path = `/rest/api/3/issue/${encodeURIComponent(issue.key)}/comment`;
+  const bodies = [];
+  while (bodies.length < total) {
+    const page = await client.get(path, {
+      orderBy: "created",
+      startAt: bodies.length,
+      maxResults: COMMENT_PAGE_SIZE
+    });
+    if (!page.ok) return page;
+    const answered2 = record(page.value)?.["comments"];
+    if (!Array.isArray(answered2)) return shapeError(`GET ${path} answered no comments list`);
+    if (answered2.length === 0) break;
+    bodies.push(...answered2.map((comment) => record(comment)?.["body"]));
+  }
+  return jiraOk(bodies);
+}
+async function parentDescriptions(client, issues) {
+  const onPage = new Map(issues.map((issue) => [issue.key, issue.fields["description"]]));
+  const descriptions = /* @__PURE__ */ new Map();
+  const missing = /* @__PURE__ */ new Set();
+  for (const issue of issues) {
+    const parent = record(issue.fields["parent"])?.["key"];
+    if (typeof parent !== "string") continue;
+    if (onPage.has(parent)) descriptions.set(parent, onPage.get(parent));
+    else missing.add(parent);
+  }
+  if (missing.size === 0) return jiraOk(descriptions);
+  const fetched = await bulkIssues(client, [...missing], ["description"]);
+  if (!fetched.ok) return fetched;
+  for (const issue of fetched.value.issues)
+    descriptions.set(issue.key, issue.fields["description"]);
+  return jiraOk(descriptions);
+}
+var BULK_FETCH_SIZE = 100;
+var BULK_FETCH_PATH = "/rest/api/3/issue/bulkfetch";
+async function bulkIssues(client, idsOrKeys, fields) {
+  const issues = [];
+  const refused2 = /* @__PURE__ */ new Set();
+  for (let start = 0; start < idsOrKeys.length; start += BULK_FETCH_SIZE) {
+    const answer = await client.post(BULK_FETCH_PATH, {
+      issueIdsOrKeys: idsOrKeys.slice(start, start + BULK_FETCH_SIZE),
+      fields
+    });
+    if (!answer.ok) return answer;
+    const body = record(answer.value);
+    const fetched = body?.["issues"];
+    if (!Array.isArray(fetched))
+      return shapeError(`POST ${BULK_FETCH_PATH} answered no issues list`);
+    for (const issue of fetched) {
+      const checked = issueOf(issue);
+      if (checked !== void 0) issues.push(checked);
+    }
+    const errors = body?.["issueErrors"];
+    for (const error of Array.isArray(errors) ? errors : []) {
+      const named2 = record(error)?.["issueIdsOrKeys"];
+      for (const key of Array.isArray(named2) ? named2 : []) {
+        if (typeof key === "string") refused2.add(key);
+      }
+    }
+  }
+  return jiraOk({ issues, refused: refused2 });
+}
+function issueOf(value) {
+  const issue = record(value);
+  const fields = record(issue?.["fields"]);
+  const id = issue?.["id"];
+  const key = issue?.["key"];
+  if (typeof id !== "string" || id === "" || typeof key !== "string" || key === "") {
+    return void 0;
+  }
+  return fields === void 0 ? void 0 : { id, key, fields };
+}
+function shapeError(message) {
+  return jiraError("E_JIRA_RESPONSE", `${message}.`);
+}
+
 // src/cursor.ts
 var MAX_CURSOR_LENGTH = 4e3;
 function encodeCursor(cursor) {
@@ -398,7 +691,7 @@ function fingerprint(text2) {
 // src/cache.ts
 var FRESH_MILLISECONDS = 10 * 60 * 1e3;
 var ENTRY_LIMIT_BYTES = 32 * 1024 * 1024;
-var SEARCH_PATH = "/rest/api/3/search/jql";
+var SEARCH_PATH2 = "/rest/api/3/search/jql";
 var BULK_PATH = "/rest/api/3/issue/bulkfetch";
 var COMMENT_PATH = /^\/rest\/api\/3\/issue\/([^/]+)\/comment$/;
 function cacheKey(call) {
@@ -473,7 +766,7 @@ function recordingClient(client) {
   const comments = {};
   const kept = (path, value) => {
     const comment = COMMENT_PATH.exec(path)?.[1];
-    if (path === SEARCH_PATH) search = value;
+    if (path === SEARCH_PATH2) search = value;
     else if (path === BULK_PATH) parents = value;
     else if (comment !== void 0) (comments[comment] ??= []).push(value);
   };
@@ -501,7 +794,7 @@ function replayingClient(raw) {
   const read = {};
   const missing = () => jiraError("E_JIRA_RESPONSE", NOT_RECORDED);
   const answer = (path) => {
-    if (path === SEARCH_PATH) return jiraOk(raw.search);
+    if (path === SEARCH_PATH2) return jiraOk(raw.search);
     if (path === BULK_PATH) return raw.parents === null ? missing() : jiraOk(raw.parents);
     const key = COMMENT_PATH.exec(path)?.[1];
     if (key === void 0) return missing();
@@ -516,142 +809,6 @@ function replayingClient(raw) {
     put: async () => missing(),
     myself: async () => missing()
   };
-}
-
-// src/config.ts
-var RAW_RECORD = {
-  safeParse: (value) => ({ success: true, data: value })
-};
-var CLOUD_DOMAIN = ".atlassian.net";
-var NOT_CLOUD = "Only Jira Cloud on <site>.atlassian.net is supported. Jira Data Center and Server, and a Cloud site on a custom domain, are out: the plugin may reach only *.atlassian.net.";
-async function resolveJiraConfig(host, section) {
-  const settings = readSettings(host);
-  const sectionSite = siteInSection(section);
-  if (!sectionSite.ok) return sectionSite;
-  const written = sectionSite.value ?? settings.baseUrl;
-  if (written === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No Jira site is set. Write it as baseUrl in the jira section of .tyto/project.json, or as jira.baseUrl in settings.json, such as https://example.atlassian.net."
-    );
-  }
-  const baseUrl = cloudOrigin(written);
-  if (!baseUrl.ok) return baseUrl;
-  const token = await readCredential(host, "api-token");
-  if (!token.ok) return token;
-  if (token.value === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No Jira API token is stored. Store it as the api-token credential (TYTO_PLUGIN_JIRA_API_TOKEN on the command line, the keychain in the desktop).",
-      { hostCode: "E_CREDENTIAL_MISSING" }
-    );
-  }
-  const storedEmail = await readCredential(host, "email");
-  if (!storedEmail.ok) return storedEmail;
-  const email = storedEmail.value ?? settings.email;
-  if (email === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No email for the Jira API token. Store it as the email credential (TYTO_PLUGIN_JIRA_EMAIL on the command line), or write it as jira.email in settings.json.",
-      { hostCode: "E_CREDENTIAL_MISSING" }
-    );
-  }
-  return jiraOk({ baseUrl: baseUrl.value, email, token: token.value });
-}
-function cloudOrigin(written) {
-  let url;
-  try {
-    url = new URL(written.trim());
-  } catch {
-    return jiraError("E_JIRA_CONFIG", `'${written}' is not a URL. ${NOT_CLOUD}`);
-  }
-  if (url.protocol !== "https:") {
-    return jiraError("E_JIRA_CONFIG", `'${written}' is not https. ${NOT_CLOUD}`);
-  }
-  const site = url.hostname.slice(0, -CLOUD_DOMAIN.length);
-  if (!url.hostname.endsWith(CLOUD_DOMAIN) || site.length === 0 || site.includes(".")) {
-    return jiraError("E_JIRA_CONFIG", `'${url.hostname}' is not a Jira Cloud site. ${NOT_CLOUD}`);
-  }
-  if (url.port !== "" || url.username !== "" || url.password !== "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `'${written}' carries a port or a user name; write the site alone, such as https://${url.hostname}.`
-    );
-  }
-  if (url.pathname !== "/" && url.pathname !== "" || url.search !== "" || url.hash !== "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `'${written}' carries a path; write the site alone, such as https://${url.hostname}.`
-    );
-  }
-  return jiraOk(url.origin);
-}
-function readSettings(host) {
-  const raw = host.config(RAW_RECORD);
-  if (typeof raw !== "object" || raw === null) return {};
-  const record2 = raw;
-  const baseUrl = nonEmptyString(record2["baseUrl"]);
-  const email = nonEmptyString(record2["email"]);
-  return {
-    ...baseUrl === void 0 ? {} : { baseUrl },
-    ...email === void 0 ? {} : { email }
-  };
-}
-function siteInSection(section) {
-  if (section === void 0 || section === null) return jiraOk(void 0);
-  if (typeof section !== "object" || Array.isArray(section)) {
-    return jiraError("E_JIRA_CONFIG", "The jira section of .tyto/project.json is not an object.");
-  }
-  const value = section["baseUrl"];
-  if (value === void 0 || value === null) return jiraOk(void 0);
-  if (typeof value !== "string" || value.trim() === "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "baseUrl in the jira section of .tyto/project.json is not a URL, such as https://example.atlassian.net."
-    );
-  }
-  return jiraOk(value);
-}
-async function readCredential(host, key) {
-  try {
-    return jiraOk(nonEmptyString(await host.credentials(key)));
-  } catch (thrown) {
-    const hostCode = hostCodeOf(thrown);
-    if (hostCode === "E_CREDENTIAL_MISSING") return jiraOk(void 0);
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `Tyto could not read the ${key} credential: ${messageOf(thrown)}`,
-      hostCode === void 0 ? {} : { hostCode }
-    );
-  }
-}
-function nonEmptyString(value) {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
-}
-
-// src/diagnostics.ts
-var VERB_ID = "jira.pull";
-var REFRESH_VERB_ID = "jira.refresh";
-var TRANSITION_VERB_ID = "jira.transition";
-function verbFailed(error, verb = VERB_ID) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_VERB",
-    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
-  };
-}
-function argumentsProblem(problem3, verb = VERB_ID) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_ARGUMENTS",
-    message: `'${verb}' ${withoutFinalStop(problem3)}.`
-  };
-}
-function failed(diagnostic) {
-  return { ok: false, error: [diagnostic] };
-}
-function withoutFinalStop(text2) {
-  return text2.trim().replace(/\.+$/, "");
 }
 
 // src/fields.ts
@@ -797,162 +954,6 @@ function documentText(document) {
 }
 function configError(message) {
   return jiraError("E_JIRA_CONFIG", `${message}.`);
-}
-
-// src/search.ts
-var PAGE_SIZE = 50;
-var COMMENT_PAGE_SIZE = 100;
-var SEARCH_PATH2 = "/rest/api/3/search/jql";
-async function jqlOf(client, selector) {
-  switch (selector.kind) {
-    case "jql":
-      return jiraOk(selector.jql);
-    case "keys":
-      return jiraOk(`key in (${selector.keys.join(", ")})`);
-    case "parent":
-      return jiraOk(`parent = ${selector.key}`);
-    case "board":
-      return boardJql(client, selector.board);
-  }
-}
-async function boardJql(client, board) {
-  const configuration = await client.get(`/rest/agile/1.0/board/${board}/configuration`);
-  if (!configuration.ok) return configuration;
-  const filterId = record(record(configuration.value)?.["filter"])?.["id"];
-  if (typeof filterId !== "string" && typeof filterId !== "number") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `board ${board} has no saved filter, so there is no JQL to pull it by. Pull its project with jql= instead.`
-    );
-  }
-  const filter = await client.get(`/rest/api/3/filter/${encodeURIComponent(String(filterId))}`);
-  if (!filter.ok) return filter;
-  const jql = record(filter.value)?.["jql"];
-  if (typeof jql !== "string" || jql.trim() === "") {
-    return jiraError(
-      "E_JIRA_RESPONSE",
-      `filter ${String(filterId)} of board ${board} answered no JQL.`
-    );
-  }
-  return jiraOk(jql);
-}
-async function searchPage(client, jql, fields, token) {
-  const answer = await client.post(SEARCH_PATH2, {
-    jql,
-    fields,
-    maxResults: PAGE_SIZE,
-    ...token === void 0 ? {} : { nextPageToken: token }
-  });
-  if (!answer.ok) return answer;
-  const body = record(answer.value);
-  const issues = body?.["issues"];
-  if (body === void 0 || !Array.isArray(issues)) {
-    return shapeError(`POST ${SEARCH_PATH2} answered no issues list`);
-  }
-  const pulled = [];
-  for (const issue of issues) {
-    const checked = issueOf(issue);
-    if (checked === void 0) {
-      return shapeError(`POST ${SEARCH_PATH2} answered an issue without an id, a key or fields`);
-    }
-    pulled.push(checked);
-  }
-  const next = body["nextPageToken"];
-  if (next !== void 0 && next !== null && (typeof next !== "string" || next === "")) {
-    return shapeError(`POST ${SEARCH_PATH2} answered a nextPageToken that is not text`);
-  }
-  const nextPageToken = typeof next === "string" ? next : void 0;
-  const isLast = body["isLast"];
-  if (isLast !== void 0 && typeof isLast !== "boolean") {
-    return shapeError(`POST ${SEARCH_PATH2} answered an isLast that is not true or false`);
-  }
-  return jiraOk({
-    issues: pulled,
-    ...nextPageToken === void 0 ? {} : { nextPageToken },
-    isLast: isLast ?? nextPageToken === void 0
-  });
-}
-async function commentBodies(client, issue) {
-  const embedded = record(issue.fields["comment"]);
-  const comments = Array.isArray(embedded?.["comments"]) ? embedded["comments"] : [];
-  const total = embedded?.["total"];
-  if (typeof total !== "number" || total <= comments.length) {
-    return jiraOk(comments.map((comment) => record(comment)?.["body"]));
-  }
-  const path = `/rest/api/3/issue/${encodeURIComponent(issue.key)}/comment`;
-  const bodies = [];
-  while (bodies.length < total) {
-    const page = await client.get(path, {
-      orderBy: "created",
-      startAt: bodies.length,
-      maxResults: COMMENT_PAGE_SIZE
-    });
-    if (!page.ok) return page;
-    const answered2 = record(page.value)?.["comments"];
-    if (!Array.isArray(answered2)) return shapeError(`GET ${path} answered no comments list`);
-    if (answered2.length === 0) break;
-    bodies.push(...answered2.map((comment) => record(comment)?.["body"]));
-  }
-  return jiraOk(bodies);
-}
-async function parentDescriptions(client, issues) {
-  const onPage = new Map(issues.map((issue) => [issue.key, issue.fields["description"]]));
-  const descriptions = /* @__PURE__ */ new Map();
-  const missing = /* @__PURE__ */ new Set();
-  for (const issue of issues) {
-    const parent = record(issue.fields["parent"])?.["key"];
-    if (typeof parent !== "string") continue;
-    if (onPage.has(parent)) descriptions.set(parent, onPage.get(parent));
-    else missing.add(parent);
-  }
-  if (missing.size === 0) return jiraOk(descriptions);
-  const fetched = await bulkIssues(client, [...missing], ["description"]);
-  if (!fetched.ok) return fetched;
-  for (const issue of fetched.value.issues)
-    descriptions.set(issue.key, issue.fields["description"]);
-  return jiraOk(descriptions);
-}
-var BULK_FETCH_SIZE = 100;
-var BULK_FETCH_PATH = "/rest/api/3/issue/bulkfetch";
-async function bulkIssues(client, idsOrKeys, fields) {
-  const issues = [];
-  const refused2 = /* @__PURE__ */ new Set();
-  for (let start = 0; start < idsOrKeys.length; start += BULK_FETCH_SIZE) {
-    const answer = await client.post(BULK_FETCH_PATH, {
-      issueIdsOrKeys: idsOrKeys.slice(start, start + BULK_FETCH_SIZE),
-      fields
-    });
-    if (!answer.ok) return answer;
-    const body = record(answer.value);
-    const fetched = body?.["issues"];
-    if (!Array.isArray(fetched))
-      return shapeError(`POST ${BULK_FETCH_PATH} answered no issues list`);
-    for (const issue of fetched) {
-      const checked = issueOf(issue);
-      if (checked !== void 0) issues.push(checked);
-    }
-    const errors = body?.["issueErrors"];
-    for (const error of Array.isArray(errors) ? errors : []) {
-      const named2 = record(error)?.["issueIdsOrKeys"];
-      for (const key of Array.isArray(named2) ? named2 : []) {
-        if (typeof key === "string") refused2.add(key);
-      }
-    }
-  }
-  return jiraOk({ issues, refused: refused2 });
-}
-function issueOf(value) {
-  const issue = record(value);
-  const fields = record(issue?.["fields"]);
-  const id = issue?.["id"];
-  const key = issue?.["key"];
-  if (typeof id !== "string" || id === "" || typeof key !== "string" || key === "") {
-    return void 0;
-  }
-  return fields === void 0 ? void 0 : { id, key, fields };
-}
-function shapeError(message) {
-  return jiraError("E_JIRA_RESPONSE", `${message}.`);
 }
 
 // src/rows.ts
@@ -1153,283 +1154,6 @@ function selectorOf(name, values) {
   return { kind: "keys", keys: [...new Set(keys)] };
 }
 
-// src/refresh.ts
-var MAX_KEYS = 1e3;
-var MAX_CHILDREN = 5e3;
-var BUDGET_MILLISECONDS = 25e3;
-var PARENTS_PER_SEARCH = 100;
-var ARGUMENTS2 = [
-  { name: "by", type: "text" },
-  { name: "only", type: "text" },
-  { name: "children", type: "boolean" }
-];
-var systemClock = { now: () => Date.now() };
-function refreshVerb(host, clock = systemClock) {
-  return {
-    id: REFRESH_VERB_ID,
-    kind: "transform",
-    arguments: ARGUMENTS2,
-    transform: (request) => refreshTable(host, request, clock)
-  };
-}
-async function refreshTable(host, request, clock = systemClock) {
-  const { table } = request;
-  const asked = readArguments(request);
-  if ("severity" in asked) return refused(asked);
-  const { by, only, children } = asked;
-  const mapped = mappedFields(request.section);
-  if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
-  const jiraNames = /* @__PURE__ */ new Set([
-    ...FIXED_COLUMNS.map((column) => column.name),
-    ...mapped.value.map(({ column }) => column)
-  ]);
-  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
-    return refused(
-      problem(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
-    );
-  }
-  const keyOf = (row) => {
-    const value = by === void 0 ? row.key : row.values[by.name];
-    const key = typeof value === "string" ? value.trim() : void 0;
-    return key !== void 0 && ISSUE_KEY.test(key) ? key : void 0;
-  };
-  const keys = [
-    ...new Set(
-      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
-    )
-  ];
-  if (keys.length > MAX_KEYS) {
-    return refused(
-      narrow(
-        `would refresh ${issueCount(keys.length)}, more than the ${count(MAX_KEYS)} one call takes`
-      )
-    );
-  }
-  const config = await resolveJiraConfig(host, request.section);
-  if (!config.ok) return refused(verbFailed(config.error, REFRESH_VERB_ID));
-  const deadline = clock.now() + BUDGET_MILLISECONDS;
-  let overBudget = false;
-  const client = createJiraClient({
-    config: config.value,
-    fetch: (url, init) => {
-      if (clock.now() > deadline) {
-        overBudget = true;
-        return Promise.reject(new Error("the refresh ran out of time"));
-      }
-      return host.fetch(url, init);
-    },
-    sleep: async (milliseconds) => {
-      if (clock.now() + milliseconds > deadline) overBudget = true;
-      else await (clock.sleep ?? wait)(milliseconds);
-    }
-  });
-  const jiraFailed = (error) => overBudget ? refused(
-    narrow(
-      `did not finish ${issueCount(keys.length)} within ${BUDGET_MILLISECONDS / 1e3} s`
-    )
-  ) : refused(verbFailed(error, REFRESH_VERB_ID));
-  const types = await mappedTypes(client, mapped.value);
-  if (!types.ok) return jiraFailed(types.error);
-  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
-  const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
-  for (const target of targets) {
-    const column = existing.get(target.name);
-    if (column !== void 0 && column.type !== target.type) {
-      return refused(
-        problem(
-          `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
-        )
-      );
-    }
-  }
-  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
-  const found = await fetchIssues(client, keys, fields);
-  if (!found.ok) return jiraFailed(found.error);
-  const issues = /* @__PURE__ */ new Map();
-  for (const issue of found.value.values()) issues.set(issue.key, issue);
-  if (children) {
-    const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
-    const read2 = await childrenOf(client, parents, fields);
-    if (!read2.ok) return jiraFailed(read2.error);
-    if (read2.value === "too many") {
-      return refused(
-        narrow(`found more than ${count(MAX_CHILDREN)} children of ${issueCount(parents.length)}`)
-      );
-    }
-    for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
-  }
-  const ordered = [...issues.values()];
-  const read = await readIssues(client, ordered);
-  if (!read.ok) return jiraFailed(read.error);
-  const fetchedAt = new Date(clock.now()).toISOString();
-  const nameOf = (name) => existing.get(name)?.name ?? name;
-  const live = /* @__PURE__ */ new Map();
-  for (const [index, issue] of ordered.entries()) {
-    const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
-      baseUrl: config.value.baseUrl,
-      fetchedAt,
-      mapped: mapped.value,
-      types: types.value
-    });
-    if (!row.ok) return jiraFailed(row.error);
-    const values = {};
-    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
-    live.set(issue.key, {
-      key: issue.key,
-      values,
-      provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
-    });
-  }
-  const added = targets.filter((target) => !existing.has(target.name));
-  const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
-  const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
-  const askedKeys = new Set(keys);
-  const rowKeys = new Set(table.rows.map((row) => row.key));
-  const present = /* @__PURE__ */ new Set();
-  const rows = table.rows.map((row) => {
-    const key = keyOf(row);
-    if (key === void 0) return { ...row, values: { ...addedNulls, ...row.values } };
-    const issue = found.value.get(key) ?? issues.get(key);
-    const fresh = issue === void 0 ? void 0 : live.get(issue.key);
-    if (fresh !== void 0) {
-      present.add(fresh.key);
-      return { ...row, values: { ...row.values, ...fresh.values }, provenance: fresh.provenance };
-    }
-    if (!askedKeys.has(key)) return { ...row, values: { ...addedNulls, ...row.values } };
-    const values = { ...row.values, ...jiraNulls };
-    if (by !== void 0) values[by.name] = row.values[by.name] ?? null;
-    return { ...row, values };
-  });
-  const emptyRow = Object.fromEntries(
-    [...table.columns.map((column) => column.name), ...added.map((column) => column.name)].map(
-      (name) => [name, null]
-    )
-  );
-  for (const [key, fresh] of live) {
-    if (present.has(key)) continue;
-    if (rowKeys.has(key)) {
-      return refused(
-        problem(
-          `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
-        )
-      );
-    }
-    const values = { ...emptyRow, ...fresh.values };
-    if (by !== void 0) values[by.name] = key;
-    rows.push({ ...fresh, values });
-  }
-  return { ok: true, value: { columns: [...table.columns, ...added], rows }, diagnostics: [] };
-}
-function readArguments(request) {
-  const columns = new Map(
-    request.table.columns.map((column) => [column.name.toLowerCase(), column])
-  );
-  const columnOf = (name) => {
-    const written = request.arguments[name];
-    if (written === void 0) return void 0;
-    const column = columns.get(String(written).trim().toLowerCase());
-    return column ?? problem(`${name}= names '${String(written)}', which is not a column of the table`);
-  };
-  const by = columnOf("by");
-  if (by !== void 0 && "severity" in by) return by;
-  if (by !== void 0 && by.type !== "text") {
-    return problem(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
-  }
-  const only = columnOf("only");
-  if (only !== void 0 && "severity" in only) return only;
-  if (only !== void 0 && only.type !== "boolean") {
-    return problem(
-      `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
-    );
-  }
-  return { by, only, children: request.arguments["children"] === true };
-}
-async function fetchIssues(client, keys, fields) {
-  const answered2 = await bulkIssues(client, keys, fields);
-  if (!answered2.ok) return answered2;
-  const byKey = new Map(answered2.value.issues.map((issue) => [issue.key, issue]));
-  const found = /* @__PURE__ */ new Map();
-  for (const key of keys) {
-    const issue = byKey.get(key);
-    if (issue !== void 0) {
-      found.set(key, issue);
-      continue;
-    }
-    if (answered2.value.refused.has(key)) continue;
-    const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
-    const single = await client.get(path, { fields: fields.join(",") });
-    if (!single.ok) {
-      if (single.error.status === 404) continue;
-      return single;
-    }
-    const moved = issueOf(single.value);
-    if (moved === void 0) {
-      return jiraError(
-        "E_JIRA_RESPONSE",
-        `GET ${path} answered an issue without an id, a key or fields.`
-      );
-    }
-    found.set(key, moved);
-  }
-  return jiraOk(found);
-}
-async function childrenOf(client, parents, fields) {
-  const children = [];
-  for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
-    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
-    let token;
-    for (; ; ) {
-      const page = await searchPage(client, jql, fields, token);
-      if (!page.ok) return page;
-      children.push(...page.value.issues);
-      if (children.length > MAX_CHILDREN) return jiraOk("too many");
-      const next = page.value.nextPageToken;
-      if (page.value.isLast || next === void 0) break;
-      if (next === token) {
-        return jiraError("E_JIRA_RESPONSE", "the children search answered the token it was given.");
-      }
-      token = next;
-    }
-  }
-  return jiraOk(children);
-}
-function problem(text2) {
-  return argumentsProblem(text2, REFRESH_VERB_ID);
-}
-function narrow(what) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_VERB",
-    message: `'${REFRESH_VERB_ID}' ${what}; narrow it with only=.`
-  };
-}
-function refused(diagnostic) {
-  return { ok: false, error: [diagnostic] };
-}
-function issueCount(value) {
-  return `${count(value)} ${value === 1 ? "issue" : "issues"}`;
-}
-function count(value) {
-  return value.toLocaleString("en-US");
-}
-var wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-
-// src/settings.ts
-var SETTINGS = [
-  {
-    id: "baseUrl",
-    form: { type: "string", nullable: true, format: "uri" },
-    default: null,
-    description: "The Jira Cloud site, such as https://example.atlassian.net. A workspace may name its own in the jira section of .tyto/project.json, which wins."
-  },
-  {
-    id: "email",
-    form: { type: "string", nullable: true, minLength: 3 },
-    default: null,
-    description: "The email the API token belongs to, when it is not stored as the email credential."
-  }
-];
-
 // src/write/plan.ts
 var MAX_DESCRIPTION_LENGTH = 500;
 var MAX_PAYLOAD_BYTES = 2048;
@@ -1480,11 +1204,11 @@ function shortened(text2, limit = MAX_DESCRIPTION_LENGTH) {
 }
 
 // src/write/apply.ts
-var systemClock2 = { now: () => Date.now() };
+var systemClock = { now: () => Date.now() };
 var APPLY_BUDGET_MILLISECONDS = 2e4;
 var NOT_REACHED = "not reached in this call's time; run the cell and Apply again";
 var DRIFT_FIELDS = ["status", "assignee", "updated"];
-async function applyBatch(host, request, verb, clock = systemClock2) {
+async function applyBatch(host, request, verb, clock = systemClock) {
   const { operations } = request;
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return answered(operations.map(() => failedWith(config.error)));
@@ -1503,7 +1227,7 @@ async function applyBatch(host, request, verb, clock = systemClock2) {
     },
     sleep: async (milliseconds) => {
       if (clock.now() + milliseconds > deadline) outOfTime = true;
-      else await (clock.sleep ?? wait2)(milliseconds);
+      else await (clock.sleep ?? wait)(milliseconds);
     }
   });
   const decoded = operations.map((operation) => decodeOperation(operation.payload, verb));
@@ -1600,7 +1324,440 @@ function answered(operations) {
 function same(left, right) {
   return (left ?? "").trim().toLowerCase() === (right ?? "").trim().toLowerCase();
 }
+var wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// src/assign.ts
+var ASSIGN_WRITE = "assign";
+var ARGUMENTS2 = [{ name: "to", type: "text", required: true }];
+var ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/;
+function assignVerb(host, clock = systemClock) {
+  return {
+    id: ASSIGN_VERB_ID,
+    kind: "action",
+    arguments: ARGUMENTS2,
+    writes: [ASSIGN_WRITE],
+    plan: (request) => planAssignments(host, request),
+    apply: (request) => applyAssignments(host, request, clock)
+  };
+}
+async function planAssignments(host, request) {
+  const { table } = request;
+  const written = String(request.arguments["to"] ?? "").trim();
+  let target;
+  if (written.toLowerCase() === "me") target = { kind: "me" };
+  else if (written.toLowerCase() === "none") target = { kind: "none" };
+  else {
+    const column = columnNamed(table, written);
+    if (column === void 0) {
+      return planRefused(
+        problem(
+          `to= names '${written}', which is neither me, none nor a column of the table holding account ids`
+        )
+      );
+    }
+    if (column.type !== "text") {
+      return planRefused(
+        problem(`to= names ${column.name}, a ${column.type} column; an account id is text`)
+      );
+    }
+    target = { kind: "column", column };
+  }
+  const assignee = columnNamed(table, "assignee");
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return planRefused(verbFailed(config.error, ASSIGN_VERB_ID));
+  const operations = [];
+  for (const row of table.rows) {
+    const key = issueKeyOf(row) ?? row.key;
+    const fail = (description, reason) => {
+      operations.push(plannedFailure(ASSIGN_WRITE, row.key, description, reason));
+    };
+    if (issueKeyOf(row) === void 0) {
+      fail(
+        `${row.key}: assign`,
+        `E_JIRA_PLAN: row ${row.key} names no issue key in its key column or its key`
+      );
+      continue;
+    }
+    const from = assignee === void 0 ? void 0 : row.values[assignee.name];
+    const drift = assignee === void 0 ? {} : { f: typeof from === "string" && from.trim() !== "" ? from : null };
+    const before = typeof from === "string" && from.trim() !== "" ? `${from} \u2192 ` : "";
+    if (target.kind === "me") {
+      operations.push(
+        plannedOperation(ASSIGN_WRITE, row.key, `${key}: ${before}the token's own account`, {
+          k: key,
+          ...drift,
+          me: true
+        })
+      );
+      continue;
+    }
+    if (target.kind === "none") {
+      operations.push(
+        plannedOperation(ASSIGN_WRITE, row.key, `${key}: ${before}unassigned`, {
+          k: key,
+          ...drift,
+          t: null
+        })
+      );
+      continue;
+    }
+    const value = row.values[target.column.name];
+    const accountId = typeof value === "string" ? value.trim() : "";
+    if (accountId === "") {
+      fail(`${key}: assign`, `E_JIRA_PLAN: ${key} has no account id in ${target.column.name}`);
+      continue;
+    }
+    if (!ACCOUNT_ID.test(accountId)) {
+      fail(
+        `${key}: assign`,
+        `E_JIRA_PLAN: ${JSON.stringify(accountId.slice(0, 80))} in ${target.column.name} is not a Jira account id; write the id, not a name or an email`
+      );
+      continue;
+    }
+    operations.push(
+      plannedOperation(ASSIGN_WRITE, row.key, `${key}: ${before}${accountId}`, {
+        k: key,
+        ...drift,
+        t: accountId
+      })
+    );
+  }
+  return planOf(`Jira ${new URL(config.value.baseUrl).hostname}`, operations);
+}
+function applyAssignments(host, request, clock = systemClock) {
+  let me;
+  return applyBatch(
+    host,
+    request,
+    {
+      decode,
+      async write(planned, issue, context) {
+        if (planned.me === true && me === void 0) {
+          const account = await context.client.myself();
+          if (!account.ok) return failedWith(account.error);
+          me = account.value.accountId;
+        }
+        return assign(
+          planned,
+          planned.me === true ? me : planned.t ?? null,
+          issue,
+          context
+        );
+      }
+    },
+    clock
+  );
+}
+function decode(payload) {
+  const { k, f, t, me } = payload;
+  if (typeof k !== "string") return void 0;
+  if (f !== void 0 && f !== null && typeof f !== "string") return void 0;
+  const drift = f === void 0 ? {} : { f };
+  if (me === true) return { k, ...drift, me: true };
+  if (t === null || typeof t === "string") return { k, ...drift, t };
+  return void 0;
+}
+async function assign(planned, accountId, issue, context) {
+  const key = planned.k;
+  const now = issue.assignee;
+  if (now?.accountId === accountId || now === null && accountId === null) {
+    return {
+      status: "applied",
+      reason: `already ${accountId === null ? "unassigned" : `assigned to ${now?.displayName ?? accountId}`}; nothing written`
+    };
+  }
+  if (planned.f !== void 0 && !same(now?.displayName ?? null, planned.f)) {
+    return {
+      status: "failed",
+      reason: `E_JIRA_MOVED: ${key} was assigned to ${planned.f ?? "nobody"} when planned and is assigned to ${now?.displayName ?? "nobody"} now; run the cell again`
+    };
+  }
+  const path = `/rest/api/3/issue/${encodeURIComponent(key)}/assignee`;
+  const put = await context.client.put(path, { accountId });
+  if (!put.ok) return failedWith(put.error);
+  issue.assignee = accountId === null ? null : { accountId, displayName: null };
+  return { status: "applied" };
+}
+function problem(text2) {
+  return argumentsProblem(text2, ASSIGN_VERB_ID);
+}
+
+// src/refresh.ts
+var MAX_KEYS = 1e3;
+var MAX_CHILDREN = 5e3;
+var BUDGET_MILLISECONDS = 25e3;
+var PARENTS_PER_SEARCH = 100;
+var ARGUMENTS3 = [
+  { name: "by", type: "text" },
+  { name: "only", type: "text" },
+  { name: "children", type: "boolean" }
+];
+var systemClock2 = { now: () => Date.now() };
+function refreshVerb(host, clock = systemClock2) {
+  return {
+    id: REFRESH_VERB_ID,
+    kind: "transform",
+    arguments: ARGUMENTS3,
+    transform: (request) => refreshTable(host, request, clock)
+  };
+}
+async function refreshTable(host, request, clock = systemClock2) {
+  const { table } = request;
+  const asked = readArguments(request);
+  if ("severity" in asked) return refused(asked);
+  const { by, only, children } = asked;
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
+  const jiraNames = /* @__PURE__ */ new Set([
+    ...FIXED_COLUMNS.map((column) => column.name),
+    ...mapped.value.map(({ column }) => column)
+  ]);
+  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
+    return refused(
+      problem2(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
+    );
+  }
+  const keyOf = (row) => {
+    const value = by === void 0 ? row.key : row.values[by.name];
+    const key = typeof value === "string" ? value.trim() : void 0;
+    return key !== void 0 && ISSUE_KEY.test(key) ? key : void 0;
+  };
+  const keys = [
+    ...new Set(
+      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
+    )
+  ];
+  if (keys.length > MAX_KEYS) {
+    return refused(
+      narrow(
+        `would refresh ${issueCount(keys.length)}, more than the ${count(MAX_KEYS)} one call takes`
+      )
+    );
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return refused(verbFailed(config.error, REFRESH_VERB_ID));
+  const deadline = clock.now() + BUDGET_MILLISECONDS;
+  let overBudget = false;
+  const client = createJiraClient({
+    config: config.value,
+    fetch: (url, init) => {
+      if (clock.now() > deadline) {
+        overBudget = true;
+        return Promise.reject(new Error("the refresh ran out of time"));
+      }
+      return host.fetch(url, init);
+    },
+    sleep: async (milliseconds) => {
+      if (clock.now() + milliseconds > deadline) overBudget = true;
+      else await (clock.sleep ?? wait2)(milliseconds);
+    }
+  });
+  const jiraFailed = (error) => overBudget ? refused(
+    narrow(
+      `did not finish ${issueCount(keys.length)} within ${BUDGET_MILLISECONDS / 1e3} s`
+    )
+  ) : refused(verbFailed(error, REFRESH_VERB_ID));
+  const types = await mappedTypes(client, mapped.value);
+  if (!types.ok) return jiraFailed(types.error);
+  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
+  const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
+  for (const target of targets) {
+    const column = existing.get(target.name);
+    if (column !== void 0 && column.type !== target.type) {
+      return refused(
+        problem2(
+          `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
+        )
+      );
+    }
+  }
+  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
+  const found = await fetchIssues(client, keys, fields);
+  if (!found.ok) return jiraFailed(found.error);
+  const issues = /* @__PURE__ */ new Map();
+  for (const issue of found.value.values()) issues.set(issue.key, issue);
+  if (children) {
+    const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
+    const read2 = await childrenOf(client, parents, fields);
+    if (!read2.ok) return jiraFailed(read2.error);
+    if (read2.value === "too many") {
+      return refused(
+        narrow(`found more than ${count(MAX_CHILDREN)} children of ${issueCount(parents.length)}`)
+      );
+    }
+    for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
+  }
+  const ordered = [...issues.values()];
+  const read = await readIssues(client, ordered);
+  if (!read.ok) return jiraFailed(read.error);
+  const fetchedAt = new Date(clock.now()).toISOString();
+  const nameOf = (name) => existing.get(name)?.name ?? name;
+  const live = /* @__PURE__ */ new Map();
+  for (const [index, issue] of ordered.entries()) {
+    const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
+      baseUrl: config.value.baseUrl,
+      fetchedAt,
+      mapped: mapped.value,
+      types: types.value
+    });
+    if (!row.ok) return jiraFailed(row.error);
+    const values = {};
+    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
+    live.set(issue.key, {
+      key: issue.key,
+      values,
+      provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
+    });
+  }
+  const added = targets.filter((target) => !existing.has(target.name));
+  const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
+  const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
+  const askedKeys = new Set(keys);
+  const rowKeys = new Set(table.rows.map((row) => row.key));
+  const present = /* @__PURE__ */ new Set();
+  const rows = table.rows.map((row) => {
+    const key = keyOf(row);
+    if (key === void 0) return { ...row, values: { ...addedNulls, ...row.values } };
+    const issue = found.value.get(key) ?? issues.get(key);
+    const fresh = issue === void 0 ? void 0 : live.get(issue.key);
+    if (fresh !== void 0) {
+      present.add(fresh.key);
+      return { ...row, values: { ...row.values, ...fresh.values }, provenance: fresh.provenance };
+    }
+    if (!askedKeys.has(key)) return { ...row, values: { ...addedNulls, ...row.values } };
+    const values = { ...row.values, ...jiraNulls };
+    if (by !== void 0) values[by.name] = row.values[by.name] ?? null;
+    return { ...row, values };
+  });
+  const emptyRow = Object.fromEntries(
+    [...table.columns.map((column) => column.name), ...added.map((column) => column.name)].map(
+      (name) => [name, null]
+    )
+  );
+  for (const [key, fresh] of live) {
+    if (present.has(key)) continue;
+    if (rowKeys.has(key)) {
+      return refused(
+        problem2(
+          `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
+        )
+      );
+    }
+    const values = { ...emptyRow, ...fresh.values };
+    if (by !== void 0) values[by.name] = key;
+    rows.push({ ...fresh, values });
+  }
+  return { ok: true, value: { columns: [...table.columns, ...added], rows }, diagnostics: [] };
+}
+function readArguments(request) {
+  const columns = new Map(
+    request.table.columns.map((column) => [column.name.toLowerCase(), column])
+  );
+  const columnOf = (name) => {
+    const written = request.arguments[name];
+    if (written === void 0) return void 0;
+    const column = columns.get(String(written).trim().toLowerCase());
+    return column ?? problem2(`${name}= names '${String(written)}', which is not a column of the table`);
+  };
+  const by = columnOf("by");
+  if (by !== void 0 && "severity" in by) return by;
+  if (by !== void 0 && by.type !== "text") {
+    return problem2(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
+  }
+  const only = columnOf("only");
+  if (only !== void 0 && "severity" in only) return only;
+  if (only !== void 0 && only.type !== "boolean") {
+    return problem2(
+      `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
+    );
+  }
+  return { by, only, children: request.arguments["children"] === true };
+}
+async function fetchIssues(client, keys, fields) {
+  const answered2 = await bulkIssues(client, keys, fields);
+  if (!answered2.ok) return answered2;
+  const byKey = new Map(answered2.value.issues.map((issue) => [issue.key, issue]));
+  const found = /* @__PURE__ */ new Map();
+  for (const key of keys) {
+    const issue = byKey.get(key);
+    if (issue !== void 0) {
+      found.set(key, issue);
+      continue;
+    }
+    if (answered2.value.refused.has(key)) continue;
+    const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const single = await client.get(path, { fields: fields.join(",") });
+    if (!single.ok) {
+      if (single.error.status === 404) continue;
+      return single;
+    }
+    const moved = issueOf(single.value);
+    if (moved === void 0) {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        `GET ${path} answered an issue without an id, a key or fields.`
+      );
+    }
+    found.set(key, moved);
+  }
+  return jiraOk(found);
+}
+async function childrenOf(client, parents, fields) {
+  const children = [];
+  for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
+    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
+    let token;
+    for (; ; ) {
+      const page = await searchPage(client, jql, fields, token);
+      if (!page.ok) return page;
+      children.push(...page.value.issues);
+      if (children.length > MAX_CHILDREN) return jiraOk("too many");
+      const next = page.value.nextPageToken;
+      if (page.value.isLast || next === void 0) break;
+      if (next === token) {
+        return jiraError("E_JIRA_RESPONSE", "the children search answered the token it was given.");
+      }
+      token = next;
+    }
+  }
+  return jiraOk(children);
+}
+function problem2(text2) {
+  return argumentsProblem(text2, REFRESH_VERB_ID);
+}
+function narrow(what) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_VERB",
+    message: `'${REFRESH_VERB_ID}' ${what}; narrow it with only=.`
+  };
+}
+function refused(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function issueCount(value) {
+  return `${count(value)} ${value === 1 ? "issue" : "issues"}`;
+}
+function count(value) {
+  return value.toLocaleString("en-US");
+}
 var wait2 = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// src/settings.ts
+var SETTINGS = [
+  {
+    id: "baseUrl",
+    form: { type: "string", nullable: true, format: "uri" },
+    default: null,
+    description: "The Jira Cloud site, such as https://example.atlassian.net. A workspace may name its own in the jira section of .tyto/project.json, which wins."
+  },
+  {
+    id: "email",
+    form: { type: "string", nullable: true, minLength: 3 },
+    default: null,
+    description: "The email the API token belongs to, when it is not stored as the email credential."
+  }
+];
 
 // src/write/workflows.ts
 function workflowOf(section, name) {
@@ -1674,16 +1831,16 @@ function configError2(message) {
 
 // src/transition.ts
 var TRANSITION_WRITE = "transition";
-var ARGUMENTS3 = [
+var ARGUMENTS4 = [
   { name: "to", type: "text", required: true },
   { name: "workflow", type: "text" }
 ];
 var REACHED_NAMED = 12;
-function transitionVerb(host, clock = systemClock2) {
+function transitionVerb(host, clock = systemClock) {
   return {
     id: TRANSITION_VERB_ID,
     kind: "action",
-    arguments: ARGUMENTS3,
+    arguments: ARGUMENTS4,
     writes: [TRANSITION_WRITE],
     plan: (request) => planTransitions(host, request),
     apply: (request) => applyTransitions(host, request, clock)
@@ -1692,7 +1849,7 @@ function transitionVerb(host, clock = systemClock2) {
 async function planTransitions(host, request) {
   const { table } = request;
   const to = String(request.arguments["to"] ?? "").trim();
-  if (to === "") return planRefused(problem2("needs to=, the status to move each issue to"));
+  if (to === "") return planRefused(problem3("needs to=, the status to move each issue to"));
   const workflowName = request.arguments["workflow"];
   let workflow;
   if (workflowName !== void 0) {
@@ -1702,7 +1859,7 @@ async function planTransitions(host, request) {
     if (read.value === void 0) {
       const known = workflowNames(request.section);
       return planRefused(
-        problem2(
+        problem3(
           `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`)
         )
       );
@@ -1712,7 +1869,7 @@ async function planTransitions(host, request) {
   const status = columnNamed(table, "status");
   if (status === void 0) {
     return planRefused(
-      problem2("needs the status column jira.pull answers, to know where each issue starts")
+      problem3("needs the status column jira.pull answers, to know where each issue starts")
     );
   }
   const config = await resolveJiraConfig(host, request.section);
@@ -1781,10 +1938,10 @@ function unreachable(workflow, from, to, reached) {
   const tried = reached.length === 0 ? `${from} has no transition in it` : `the paths tried from ${from} reach only ${reached.slice(0, REACHED_NAMED).join(", ")}` + (reached.length > REACHED_NAMED ? ` and ${reached.length - REACHED_NAMED} more` : "");
   return `E_JIRA_CONFIG: workflow ${workflow} has no path from ${from} to ${to}; ${tried}`;
 }
-function applyTransitions(host, request, clock = systemClock2) {
-  return applyBatch(host, request, { decode, write: walk }, clock);
+function applyTransitions(host, request, clock = systemClock) {
+  return applyBatch(host, request, { decode: decode2, write: walk }, clock);
 }
-function decode(payload) {
+function decode2(payload) {
   const { k, f, p } = payload;
   if (typeof k !== "string" || typeof f !== "string" || !Array.isArray(p) || p.length === 0) {
     return void 0;
@@ -1863,7 +2020,7 @@ async function transitionsOf(client, key) {
 function named(transition) {
   return `${transition.name} (to ${transition.to})`;
 }
-function problem2(text2) {
+function problem3(text2) {
   return argumentsProblem(text2, TRANSITION_VERB_ID);
 }
 
@@ -1873,7 +2030,8 @@ function activate(host) {
     ...SETTINGS.map((setting) => host.registerConfiguration(setting)),
     host.registerRecipeVerb(pullVerb(host)),
     host.registerRecipeVerb(refreshVerb(host)),
-    host.registerRecipeVerb(transitionVerb(host))
+    host.registerRecipeVerb(transitionVerb(host)),
+    host.registerRecipeVerb(assignVerb(host))
   ];
   return {
     dispose() {

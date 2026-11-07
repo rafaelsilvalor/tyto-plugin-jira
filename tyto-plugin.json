@@ -5,5 +5,5 @@
   "contributes": ["configuration", "recipe-verb"],
   "permissions": ["net:*.atlassian.net", "credentials:api-token", "credentials:email"],
   "namespace": "jira",
-  "writes": ["transition"]
+  "writes": ["transition", "assign"]
 }

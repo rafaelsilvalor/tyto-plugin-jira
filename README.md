@@ -5,17 +5,18 @@ recipe. Tyto knows no provider (Tyto ADR 0011, ADR 0127): everything Jira-specif
 in its own repository, and reaches Tyto only through the plugin API. This repository is public
 and unlicensed.
 
-It adds three recipe verbs:
+It adds four recipe verbs:
 
 - **`jira.pull`**, a source: the issues a JQL query, a board, a list of keys or a parent names,
   as a table.
 - **`jira.refresh`**, a transform: the table it is handed, with each row that names an issue
   filled with what Jira holds now.
-- **`jira.transition`**, an action: it moves each row's issue to a status.
+- **`jira.transition`** and **`jira.assign`**, actions: they move each row's issue to a status,
+  or assign it to an account.
 
 **Running an action writes nothing.** Its cell shows a plan, one line per issue, and Jira
-changes only when you apply it (Tyto ADR 0129, ADR 0170). Assigning, setting fields,
-commenting and creating issues are not here yet.
+changes only when you apply it (Tyto ADR 0129, ADR 0170). Setting fields, commenting and
+creating issues are not here yet.
 
 Every example below is invented: `example.atlassian.net`, project `EX`, issues `EX-1`, `EX-2`.
 
@@ -213,6 +214,20 @@ jira.transition to=<status> [workflow=<name>]
 - Apply reads each issue first. **An issue that moved since the plan fails alone**; one already
   at `to=` is applied with nothing written; one standing on its planned path resumes from there.
 
+## `jira.assign`
+
+An action: it assigns each row's issue.
+
+```
+jira.assign to=<column>|me|none
+```
+
+- `to=<column>` takes the account id in that text column, `me` the token's own account, `none`
+  leaves the issue unassigned. There is no lookup by name or email: a cell that is not an
+  account id is a planned failure.
+- When the table holds `jira.pull`'s `assignee` column, Apply checks the issue is still assigned
+  to that person, and fails an issue reassigned since the plan.
+
 ## Applying a plan
 
 Tyto hands a plan back in batches of 100 operations. Each batch reads its issues in one search
@@ -292,7 +307,7 @@ what to read, or name a column the table lacks, are `E_RECIPE_ARGUMENTS`.
 | `E_JIRA_HTTP`       | Any other failed answer, a 429 or 503 still failing after its retries included.                  | Read Jira's own words in the message, such as a JQL mistake. Try a 429 or 503 again later.                       |
 | `E_JIRA_NETWORK`    | No answer: Tyto refused the request, or the network failed.                                      | Check the connection. A refusal by Tyto names its own code, such as `E_PERMISSION`.                              |
 | `E_JIRA_RESPONSE`   | Jira answered something that is not what its API promises.                                       | Run again; if it stays, report it with the message.                                                              |
-| `E_JIRA_PLAN`       | A planned write that cannot be applied: no issue key, no status, or too long.                    | Fix the row the reason names, run the cell, apply again.                                                         |
+| `E_JIRA_PLAN`       | A planned write that cannot be applied: no issue key, no status, no account id, or too long.     | Fix the row the reason names, run the cell, apply again.                                                         |
 | `E_JIRA_MOVED`      | The issue changed between the plan and Apply, or is gone.                                        | Run the cell again for a plan from where the issue stands now.                                                   |
 | `E_JIRA_TRANSITION` | The issue offers no transition to the next status, or more than one.                             | Check the workflow in the section against the transitions the reason names.                                      |
 
