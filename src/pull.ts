@@ -1,5 +1,6 @@
 import type { PluginHost, RecipeVerbContribution } from '@tyto/plugin-api';
 
+import { readCache, recordingClient, replayingClient, writeCache, type PageCall } from './cache.js';
 import { FIXED_COLUMNS, FIXED_FIELDS, record, rowOf } from './columns.js';
 import { resolveJiraConfig } from './config.js';
 import { decodeCursor, encodeCursor, fingerprint, type PullCursor } from './cursor.js';
@@ -15,8 +16,25 @@ import {
   type PageRequest,
   type Row,
 } from './diagnostics.js';
-import { createJiraClient } from './http.js';
-import { commentBodies, jqlOf, parentDescriptions, searchPage, type Selector } from './search.js';
+import type { JiraResult } from './errors.js';
+import {
+  mappedColumns,
+  mappedFields,
+  mappedTypes,
+  mappedValues,
+  sameColumns,
+  type MappedTypes,
+} from './fields.js';
+import { createJiraClient, type JiraClient } from './http.js';
+import {
+  PAGE_SIZE,
+  commentBodies,
+  jqlOf,
+  parentDescriptions,
+  searchPage,
+  type SearchPage,
+  type Selector,
+} from './search.js';
 
 export const DEFAULT_MAX = 10_000;
 export const MAX_MAX = 100_000;
@@ -33,12 +51,13 @@ const ARGUMENTS: readonly ArgumentSpec[] = [
 ];
 
 /** The parts of the host a pull uses. */
-export type PullHost = Pick<PluginHost, 'config' | 'credentials' | 'fetch'>;
+export type PullHost = Pick<PluginHost, 'config' | 'credentials' | 'fetch' | 'cache' | 'log'>;
 
 /**
  * `jira.pull`: issues by JQL, a board, a list of keys or a parent, one search page per call,
- * as a table with the fifteen fixed columns. The host loops over the pages (ADR 0128), so each
- * call is one search plus what its rows need: overflowing comments and missing parents.
+ * as a table with the fifteen fixed columns and the `fields:` section's mapped ones. The host
+ * loops over the pages (ADR 0128), so each call is one search plus what its rows need:
+ * overflowing comments and missing parents — or none of them, when the cache holds the page.
  */
 export function pullVerb(host: PullHost): RecipeVerbContribution {
   return {
@@ -72,6 +91,8 @@ export async function pullPage(host: PullHost, request: PageRequest): Promise<Pa
 
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return failed(verbFailed(config.error));
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return failed(verbFailed(mapped.error));
   const client = createJiraClient({
     fetch: (url, init) => host.fetch(url, init),
     config: config.value,
@@ -79,41 +100,77 @@ export async function pullPage(host: PullHost, request: PageRequest): Promise<Pa
 
   const jql = await jqlOf(client, asked.selector);
   if (!jql.ok) return failed(verbFailed(jql.error));
-  const fields = FIXED_FIELDS;
-  const requestPrint = fingerprint(JSON.stringify([config.value.baseUrl, jql.value, fields]));
-  if (cursor !== undefined && cursor.f !== requestPrint) {
-    return failed(
-      verbFailed({
-        code: 'E_JIRA_CONFIG',
-        message: 'the jira section changed during the pull; run again',
-      }),
-    );
+  const fields = [...new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
+  const requestPrint = fingerprint(
+    JSON.stringify([config.value.baseUrl, jql.value, fields, mapped.value]),
+  );
+  const changed = verbFailed({
+    code: 'E_JIRA_CONFIG',
+    message: 'the jira section changed during the pull; run again',
+  });
+  if (cursor !== undefined && cursor.f !== requestPrint) return failed(changed);
+
+  let types: MappedTypes;
+  if (cursor === undefined) {
+    const read = await mappedTypes(client, mapped.value);
+    if (!read.ok) return failed(verbFailed(read.error));
+    types = read.value;
+  } else {
+    if (!sameColumns(cursor.m, mapped.value)) return failed(changed);
+    types = cursor.m;
   }
 
-  const page = await searchPage(client, jql.value, fields, cursor?.t);
-  if (!page.ok) return failed(verbFailed(page.error));
-  const parents = await parentDescriptions(client, page.value.issues);
-  if (!parents.ok) return failed(verbFailed(parents.error));
+  const call: PageCall = {
+    baseUrl: config.value.baseUrl,
+    email: config.value.email,
+    jql: jql.value,
+    fields,
+    pageSize: PAGE_SIZE,
+    token: cursor?.t,
+    page: cursor?.p ?? 1,
+  };
+  const now = Date.now();
+  let read: PageRead | undefined;
+  let generation = cursor?.g ?? now;
+  let fetchedAt = new Date(now).toISOString();
+  let fromCache = false;
+  // A run asked to be fresh skips reading the cache, and still fills it for the next run.
+  const cached = request.refresh === true ? undefined : await readCache(host, call, cursor?.g, now);
+  if (cached !== undefined) {
+    const replayed = await readPage(replayingClient(cached.raw), call);
+    if (replayed.ok) {
+      read = replayed.value;
+      generation = cached.gen;
+      fetchedAt = cached.storedAt;
+      fromCache = true;
+    }
+  }
+  if (read === undefined) {
+    const recorder = recordingClient(client);
+    const live = await readPage(recorder.client, call);
+    if (!live.ok) return failed(verbFailed(live.error));
+    read = live.value;
+    await writeCache(host, call, generation, recorder.raw());
+  }
 
-  const fetchedAt = new Date().toISOString();
   const rows: Row[] = [];
-  for (const issue of page.value.issues) {
-    const comments = await commentBodies(client, issue);
-    if (!comments.ok) return failed(verbFailed(comments.error));
+  for (const [index, issue] of read.page.issues.entries()) {
     const parentKey = record(issue.fields['parent'])?.['key'];
-    const parent = typeof parentKey === 'string' ? parents.value.get(parentKey) : undefined;
+    const parent = typeof parentKey === 'string' ? read.parents.get(parentKey) : undefined;
     const row = rowOf(issue, {
       baseUrl: config.value.baseUrl,
       fetchedAt,
-      commentBodies: comments.value,
+      commentBodies: read.comments[index] ?? [],
       parentDescription: parent,
     });
     if (!row.ok) return failed(verbFailed(row.error));
-    rows.push(row.value);
+    const values = mappedValues(issue.fields, issue.key, mapped.value, types);
+    if (!values.ok) return failed(verbFailed(values.error));
+    rows.push({ ...row.value, values: { ...row.value.values, ...values.value } });
   }
 
-  const table = { columns: FIXED_COLUMNS, rows };
-  const { isLast, nextPageToken } = page.value;
+  const table = { columns: [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types)], rows };
+  const { isLast, nextPageToken } = read.page;
   const total = (cursor?.n ?? 0) + rows.length;
   // Never a partial table: Jira saying "more" with no way on, or more rows than `max=` allows,
   // is a page cut short, and the host turns that into an error rather than a short table.
@@ -134,11 +191,34 @@ export async function pullPage(host: PullHost, request: PageRequest): Promise<Pa
     n: total,
     p: (cursor?.p ?? 1) + 1,
     f: requestPrint,
-    m: {},
-    g: 0,
-    c: false,
+    m: types,
+    g: generation,
+    c: fromCache,
   });
   return { ok: true, value: { table, cursor: next }, diagnostics: [] };
+}
+
+/** What one page is made of, live or replayed from the cache. */
+interface PageRead {
+  readonly page: SearchPage;
+  readonly parents: ReadonlyMap<string, unknown>;
+  /** Each issue's comment bodies, in the page's order. */
+  readonly comments: readonly (readonly unknown[])[];
+}
+
+/** The search page and what its rows need, through whichever client is handed. */
+async function readPage(client: JiraClient, call: PageCall): Promise<JiraResult<PageRead>> {
+  const page = await searchPage(client, call.jql, call.fields, call.token);
+  if (!page.ok) return page;
+  const parents = await parentDescriptions(client, page.value.issues);
+  if (!parents.ok) return parents;
+  const comments: (readonly unknown[])[] = [];
+  for (const issue of page.value.issues) {
+    const bodies = await commentBodies(client, issue);
+    if (!bodies.ok) return bodies;
+    comments.push(bodies.value);
+  }
+  return { ok: true, value: { page: page.value, parents: parents.value, comments } };
 }
 
 /** The selector and `max=`, or what is wrong with the step's arguments. */

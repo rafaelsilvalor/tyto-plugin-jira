@@ -135,117 +135,6 @@ function unique(values) {
   return [...new Set(values)];
 }
 
-// src/config.ts
-var RAW_RECORD = {
-  safeParse: (value) => ({ success: true, data: value })
-};
-var CLOUD_DOMAIN = ".atlassian.net";
-var NOT_CLOUD = "Only Jira Cloud on <site>.atlassian.net is supported. Jira Data Center and Server, and a Cloud site on a custom domain, are out: the plugin may reach only *.atlassian.net.";
-async function resolveJiraConfig(host, section) {
-  const settings = readSettings(host);
-  const sectionSite = siteInSection(section);
-  if (!sectionSite.ok) return sectionSite;
-  const written = sectionSite.value ?? settings.baseUrl;
-  if (written === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No Jira site is set. Write it as baseUrl in the jira section of .tyto/project.json, or as jira.baseUrl in settings.json, such as https://example.atlassian.net."
-    );
-  }
-  const baseUrl = cloudOrigin(written);
-  if (!baseUrl.ok) return baseUrl;
-  const token = await readCredential(host, "api-token");
-  if (!token.ok) return token;
-  if (token.value === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No Jira API token is stored. Store it as the api-token credential (TYTO_PLUGIN_JIRA_API_TOKEN on the command line, the keychain in the desktop).",
-      { hostCode: "E_CREDENTIAL_MISSING" }
-    );
-  }
-  const storedEmail = await readCredential(host, "email");
-  if (!storedEmail.ok) return storedEmail;
-  const email = storedEmail.value ?? settings.email;
-  if (email === void 0) {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "No email for the Jira API token. Store it as the email credential (TYTO_PLUGIN_JIRA_EMAIL on the command line), or write it as jira.email in settings.json.",
-      { hostCode: "E_CREDENTIAL_MISSING" }
-    );
-  }
-  return jiraOk({ baseUrl: baseUrl.value, email, token: token.value });
-}
-function cloudOrigin(written) {
-  let url;
-  try {
-    url = new URL(written.trim());
-  } catch {
-    return jiraError("E_JIRA_CONFIG", `'${written}' is not a URL. ${NOT_CLOUD}`);
-  }
-  if (url.protocol !== "https:") {
-    return jiraError("E_JIRA_CONFIG", `'${written}' is not https. ${NOT_CLOUD}`);
-  }
-  const site = url.hostname.slice(0, -CLOUD_DOMAIN.length);
-  if (!url.hostname.endsWith(CLOUD_DOMAIN) || site.length === 0 || site.includes(".")) {
-    return jiraError("E_JIRA_CONFIG", `'${url.hostname}' is not a Jira Cloud site. ${NOT_CLOUD}`);
-  }
-  if (url.port !== "" || url.username !== "" || url.password !== "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `'${written}' carries a port or a user name; write the site alone, such as https://${url.hostname}.`
-    );
-  }
-  if (url.pathname !== "/" && url.pathname !== "" || url.search !== "" || url.hash !== "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `'${written}' carries a path; write the site alone, such as https://${url.hostname}.`
-    );
-  }
-  return jiraOk(url.origin);
-}
-function readSettings(host) {
-  const raw = host.config(RAW_RECORD);
-  if (typeof raw !== "object" || raw === null) return {};
-  const record2 = raw;
-  const baseUrl = nonEmptyString(record2["baseUrl"]);
-  const email = nonEmptyString(record2["email"]);
-  return {
-    ...baseUrl === void 0 ? {} : { baseUrl },
-    ...email === void 0 ? {} : { email }
-  };
-}
-function siteInSection(section) {
-  if (section === void 0 || section === null) return jiraOk(void 0);
-  if (typeof section !== "object" || Array.isArray(section)) {
-    return jiraError("E_JIRA_CONFIG", "The jira section of .tyto/project.json is not an object.");
-  }
-  const value = section["baseUrl"];
-  if (value === void 0 || value === null) return jiraOk(void 0);
-  if (typeof value !== "string" || value.trim() === "") {
-    return jiraError(
-      "E_JIRA_CONFIG",
-      "baseUrl in the jira section of .tyto/project.json is not a URL, such as https://example.atlassian.net."
-    );
-  }
-  return jiraOk(value);
-}
-async function readCredential(host, key) {
-  try {
-    return jiraOk(nonEmptyString(await host.credentials(key)));
-  } catch (thrown) {
-    const hostCode = hostCodeOf(thrown);
-    if (hostCode === "E_CREDENTIAL_MISSING") return jiraOk(void 0);
-    return jiraError(
-      "E_JIRA_CONFIG",
-      `Tyto could not read the ${key} credential: ${messageOf(thrown)}`,
-      hostCode === void 0 ? {} : { hostCode }
-    );
-  }
-}
-function nonEmptyString(value) {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
-}
-
 // src/http.ts
 var MAX_RETRIES = 3;
 var MAX_RETRY_AFTER_SECONDS = 30;
@@ -505,6 +394,237 @@ function fingerprint(text2) {
   return hash.toString(16).padStart(16, "0");
 }
 
+// src/cache.ts
+var FRESH_MILLISECONDS = 10 * 60 * 1e3;
+var ENTRY_LIMIT_BYTES = 32 * 1024 * 1024;
+var SEARCH_PATH = "/rest/api/3/search/jql";
+var BULK_PATH = "/rest/api/3/issue/bulkfetch";
+var COMMENT_PATH = /^\/rest\/api\/3\/issue\/([^/]+)\/comment$/;
+function cacheKey(call) {
+  const host = new URL(call.baseUrl).host;
+  const request = fingerprint(JSON.stringify([call.jql, call.fields, call.pageSize]));
+  return `jira/pull/v1/${host}/${fingerprint(call.email)}/${request}/${call.page}`;
+}
+function canonicalRequest(call) {
+  return JSON.stringify({
+    site: call.baseUrl,
+    jql: call.jql,
+    fields: call.fields,
+    pageSize: call.pageSize,
+    token: call.token ?? null
+  });
+}
+async function readCache(host, call, generation, now) {
+  let stored;
+  try {
+    stored = await host.cache.get(cacheKey(call));
+  } catch (thrown) {
+    host.log.warn(`jira.pull read no cache: ${messageOf(thrown)}`);
+    return void 0;
+  }
+  if (stored === void 0) return void 0;
+  if (stored.bytes.byteLength > ENTRY_LIMIT_BYTES) {
+    host.log.warn(`jira.pull ignored a cache entry of ${stored.bytes.byteLength} bytes`);
+    return void 0;
+  }
+  const entry = entryOf(stored.bytes);
+  if (entry === void 0) {
+    host.log.warn("jira.pull ignored a cache entry it did not write");
+    return void 0;
+  }
+  const age = now - Date.parse(stored.storedAt);
+  if (!(age >= 0 && age < FRESH_MILLISECONDS)) return void 0;
+  if (entry.request !== canonicalRequest(call)) return void 0;
+  if (generation !== void 0 && entry.gen !== generation) return void 0;
+  return { raw: entry.raw, gen: entry.gen, storedAt: stored.storedAt };
+}
+async function writeCache(host, call, generation, raw) {
+  const entry = { v: 1, request: canonicalRequest(call), gen: generation, raw };
+  const bytes = new TextEncoder().encode(JSON.stringify(entry));
+  if (bytes.byteLength > ENTRY_LIMIT_BYTES) {
+    host.log.warn(`jira.pull cached no page of ${bytes.byteLength} bytes, over the host's limit`);
+    return;
+  }
+  try {
+    await host.cache.put(cacheKey(call), bytes);
+  } catch (thrown) {
+    host.log.warn(`jira.pull cached nothing: ${messageOf(thrown)}`);
+  }
+}
+function entryOf(bytes) {
+  let parsed;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return void 0;
+  }
+  const entry = record(parsed);
+  const raw = record(entry?.["raw"]);
+  const comments = record(raw?.["comments"]);
+  if (entry?.["v"] !== 1 || typeof entry["request"] !== "string" || !Number.isSafeInteger(entry["gen"]) || raw === void 0 || !("search" in raw) || comments === void 0 || !Object.values(comments).every((pages) => Array.isArray(pages))) {
+    return void 0;
+  }
+  return parsed;
+}
+function recordingClient(client) {
+  let search = null;
+  let parents = null;
+  const comments = {};
+  const kept = (path, value) => {
+    const comment = COMMENT_PATH.exec(path)?.[1];
+    if (path === SEARCH_PATH) search = value;
+    else if (path === BULK_PATH) parents = value;
+    else if (comment !== void 0) (comments[comment] ??= []).push(value);
+  };
+  return {
+    client: {
+      async get(path, query) {
+        const answer = await client.get(path, query);
+        if (answer.ok) kept(path, answer.value);
+        return answer;
+      },
+      async post(path, body) {
+        const answer = await client.post(path, body);
+        if (answer.ok) kept(path, answer.value);
+        return answer;
+      },
+      myself: () => client.myself()
+    },
+    raw: () => ({ search, comments, parents })
+  };
+}
+var NOT_RECORDED = "not in the cached page";
+function replayingClient(raw) {
+  const read = {};
+  const missing = () => jiraError("E_JIRA_RESPONSE", NOT_RECORDED);
+  const answer = (path) => {
+    if (path === SEARCH_PATH) return jiraOk(raw.search);
+    if (path === BULK_PATH) return raw.parents === null ? missing() : jiraOk(raw.parents);
+    const key = COMMENT_PATH.exec(path)?.[1];
+    if (key === void 0) return missing();
+    const index = read[key] ?? 0;
+    read[key] = index + 1;
+    const pages = raw.comments[key];
+    return pages !== void 0 && index < pages.length ? jiraOk(pages[index]) : missing();
+  };
+  return {
+    get: async (path, _query) => answer(path),
+    post: async (path) => answer(path),
+    myself: async () => missing()
+  };
+}
+
+// src/config.ts
+var RAW_RECORD = {
+  safeParse: (value) => ({ success: true, data: value })
+};
+var CLOUD_DOMAIN = ".atlassian.net";
+var NOT_CLOUD = "Only Jira Cloud on <site>.atlassian.net is supported. Jira Data Center and Server, and a Cloud site on a custom domain, are out: the plugin may reach only *.atlassian.net.";
+async function resolveJiraConfig(host, section) {
+  const settings = readSettings(host);
+  const sectionSite = siteInSection(section);
+  if (!sectionSite.ok) return sectionSite;
+  const written = sectionSite.value ?? settings.baseUrl;
+  if (written === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No Jira site is set. Write it as baseUrl in the jira section of .tyto/project.json, or as jira.baseUrl in settings.json, such as https://example.atlassian.net."
+    );
+  }
+  const baseUrl = cloudOrigin(written);
+  if (!baseUrl.ok) return baseUrl;
+  const token = await readCredential(host, "api-token");
+  if (!token.ok) return token;
+  if (token.value === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No Jira API token is stored. Store it as the api-token credential (TYTO_PLUGIN_JIRA_API_TOKEN on the command line, the keychain in the desktop).",
+      { hostCode: "E_CREDENTIAL_MISSING" }
+    );
+  }
+  const storedEmail = await readCredential(host, "email");
+  if (!storedEmail.ok) return storedEmail;
+  const email = storedEmail.value ?? settings.email;
+  if (email === void 0) {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "No email for the Jira API token. Store it as the email credential (TYTO_PLUGIN_JIRA_EMAIL on the command line), or write it as jira.email in settings.json.",
+      { hostCode: "E_CREDENTIAL_MISSING" }
+    );
+  }
+  return jiraOk({ baseUrl: baseUrl.value, email, token: token.value });
+}
+function cloudOrigin(written) {
+  let url;
+  try {
+    url = new URL(written.trim());
+  } catch {
+    return jiraError("E_JIRA_CONFIG", `'${written}' is not a URL. ${NOT_CLOUD}`);
+  }
+  if (url.protocol !== "https:") {
+    return jiraError("E_JIRA_CONFIG", `'${written}' is not https. ${NOT_CLOUD}`);
+  }
+  const site = url.hostname.slice(0, -CLOUD_DOMAIN.length);
+  if (!url.hostname.endsWith(CLOUD_DOMAIN) || site.length === 0 || site.includes(".")) {
+    return jiraError("E_JIRA_CONFIG", `'${url.hostname}' is not a Jira Cloud site. ${NOT_CLOUD}`);
+  }
+  if (url.port !== "" || url.username !== "" || url.password !== "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `'${written}' carries a port or a user name; write the site alone, such as https://${url.hostname}.`
+    );
+  }
+  if (url.pathname !== "/" && url.pathname !== "" || url.search !== "" || url.hash !== "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `'${written}' carries a path; write the site alone, such as https://${url.hostname}.`
+    );
+  }
+  return jiraOk(url.origin);
+}
+function readSettings(host) {
+  const raw = host.config(RAW_RECORD);
+  if (typeof raw !== "object" || raw === null) return {};
+  const record2 = raw;
+  const baseUrl = nonEmptyString(record2["baseUrl"]);
+  const email = nonEmptyString(record2["email"]);
+  return {
+    ...baseUrl === void 0 ? {} : { baseUrl },
+    ...email === void 0 ? {} : { email }
+  };
+}
+function siteInSection(section) {
+  if (section === void 0 || section === null) return jiraOk(void 0);
+  if (typeof section !== "object" || Array.isArray(section)) {
+    return jiraError("E_JIRA_CONFIG", "The jira section of .tyto/project.json is not an object.");
+  }
+  const value = section["baseUrl"];
+  if (value === void 0 || value === null) return jiraOk(void 0);
+  if (typeof value !== "string" || value.trim() === "") {
+    return jiraError(
+      "E_JIRA_CONFIG",
+      "baseUrl in the jira section of .tyto/project.json is not a URL, such as https://example.atlassian.net."
+    );
+  }
+  return jiraOk(value);
+}
+async function readCredential(host, key) {
+  try {
+    return jiraOk(nonEmptyString(await host.credentials(key)));
+  } catch (thrown) {
+    const hostCode = hostCodeOf(thrown);
+    if (hostCode === "E_CREDENTIAL_MISSING") return jiraOk(void 0);
+    return jiraError(
+      "E_JIRA_CONFIG",
+      `Tyto could not read the ${key} credential: ${messageOf(thrown)}`,
+      hostCode === void 0 ? {} : { hostCode }
+    );
+  }
+}
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
+}
+
 // src/diagnostics.ts
 var VERB_ID = "jira.pull";
 function verbFailed(error) {
@@ -528,10 +648,155 @@ function withoutFinalStop(text2) {
   return text2.trim().replace(/\.+$/, "");
 }
 
+// src/fields.ts
+var COLUMN_NAME = /^[a-z][a-z0-9_]*$/;
+var FIXED_NAMES = new Set(FIXED_COLUMNS.map((column) => column.name));
+var MAPPED_TYPES = /* @__PURE__ */ new Set(["text", "number", "date", "datetime", "list"]);
+var FIELD_CATALOGUE = "/rest/api/3/field";
+function mappedFields(section) {
+  const fields = record(section)?.["fields"];
+  if (fields === void 0 || fields === null) return jiraOk([]);
+  const written = record(fields);
+  if (written === void 0) {
+    return configError(
+      'fields in the jira section of .tyto/project.json is not an object of column names and field ids, such as {"story_points": "customfield_10016"}'
+    );
+  }
+  const mapped = [];
+  for (const [column, id] of Object.entries(written)) {
+    if (!COLUMN_NAME.test(column)) {
+      return configError(
+        `fields names a column '${column}'; a column name is lower case letters, digits and _, starting with a letter, such as story_points`
+      );
+    }
+    if (FIXED_NAMES.has(column)) {
+      return configError(
+        `fields names a column '${column}', which every pull already answers; choose another name`
+      );
+    }
+    if (typeof id !== "string" || id.trim() === "") {
+      return configError(
+        `fields maps ${column} to ${JSON.stringify(id)}, which is not a field id, such as customfield_10016`
+      );
+    }
+    mapped.push({ column, id: id.trim() });
+  }
+  return jiraOk(mapped);
+}
+async function mappedTypes(client, mapped) {
+  if (mapped.length === 0) return jiraOk({});
+  const answer = await client.get(FIELD_CATALOGUE);
+  if (!answer.ok) return answer;
+  if (!Array.isArray(answer.value)) {
+    return jiraError("E_JIRA_RESPONSE", `GET ${FIELD_CATALOGUE} answered no list of fields.`);
+  }
+  const catalogue = answer.value.map((field) => record(field)).filter((field) => !!field);
+  const types = {};
+  for (const { column, id } of mapped) {
+    const field = catalogue.find((candidate) => candidate["id"] === id);
+    if (field === void 0) return configError(unknownField(column, id, catalogue));
+    types[column] = typeOfSchema(record(field["schema"])?.["type"]);
+  }
+  return jiraOk(types);
+}
+function unknownField(column, written, catalogue) {
+  const lowered = written.toLowerCase();
+  const named = catalogue.filter((field) => typeof field["name"] === "string" && field["name"].toLowerCase() === lowered).map((field) => field["id"]).filter((id) => typeof id === "string");
+  if (named.length === 0) {
+    return `fields maps ${column} to '${written}', and this site has no field with that id`;
+  }
+  return `fields maps ${column} to '${written}', which is a field's name, not its id; write ` + named.join(" or ");
+}
+function typeOfSchema(type) {
+  switch (type) {
+    case "number":
+      return "number";
+    case "date":
+      return "date";
+    case "datetime":
+      return "datetime";
+    case "array":
+      return "list";
+    default:
+      return "text";
+  }
+}
+function sameColumns(types, mapped) {
+  const names = Object.keys(types);
+  return names.length === mapped.length && mapped.every(({ column }) => MAPPED_TYPES.has(types[column] ?? "")) && names.every((name) => mapped.some(({ column }) => column === name));
+}
+function mappedColumns(mapped, types) {
+  return mapped.map(({ column }) => ({
+    name: column,
+    type: types[column] ?? "text",
+    origin: ORIGIN
+  }));
+}
+function mappedValues(fields, key, mapped, types) {
+  const values = {};
+  for (const { column, id } of mapped) {
+    const value = cellOf(types[column] ?? "text", fields[id], key, column);
+    if (!value.ok) return value;
+    values[column] = value.value;
+  }
+  return jiraOk(values);
+}
+var JIRA_DATE = /^\d{4}-\d{2}-\d{2}$/;
+function cellOf(type, value, key, column) {
+  if (type === "list") {
+    if (value === void 0 || value === null) return jiraOk([]);
+    return Array.isArray(value) ? jiraOk(value.map((item) => typeof item === "number" ? item : textOf(item))) : jiraOk([textOf(value)]);
+  }
+  if (value === void 0 || value === null) return jiraOk(null);
+  switch (type) {
+    case "number":
+      if (typeof value === "number" && Number.isFinite(value)) return jiraOk(value);
+      return notA(key, column, value, "number");
+    case "date":
+      if (typeof value === "string" && JIRA_DATE.test(value)) return jiraOk(value);
+      return notA(key, column, value, "date, such as 2026-10-01");
+    case "datetime":
+      return isoUtc(value, key, column);
+    case "text":
+      return jiraOk(textOf(value));
+  }
+}
+function notA(key, column, value, what) {
+  return jiraError(
+    "E_JIRA_RESPONSE",
+    `${key}'s ${column} is ${JSON.stringify(value)}, which is not a ${what}.`
+  );
+}
+function textOf(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const object = record(value);
+  if (object?.["type"] === "doc") return documentText(object);
+  for (const name of ["value", "name", "displayName"]) {
+    const shown = object?.[name];
+    if (typeof shown === "string") return shown;
+  }
+  return JSON.stringify(value) ?? "";
+}
+function documentText(document) {
+  const inline = (node) => {
+    const current = record(node);
+    if (current === void 0) return "";
+    if (typeof current["text"] === "string") return current["text"];
+    if (current["type"] === "hardBreak") return "\n";
+    return Array.isArray(current["content"]) ? current["content"].map(inline).join("") : "";
+  };
+  const blocks = Array.isArray(document["content"]) ? document["content"] : [];
+  return blocks.map(inline).filter((line) => line !== "").join("\n");
+}
+function configError(message) {
+  return jiraError("E_JIRA_CONFIG", `${message}.`);
+}
+
 // src/search.ts
 var PAGE_SIZE = 50;
 var COMMENT_PAGE_SIZE = 100;
-var SEARCH_PATH = "/rest/api/3/search/jql";
+var SEARCH_PATH2 = "/rest/api/3/search/jql";
 async function jqlOf(client, selector) {
   switch (selector.kind) {
     case "jql":
@@ -566,7 +831,7 @@ async function boardJql(client, board) {
   return jiraOk(jql);
 }
 async function searchPage(client, jql, fields, token) {
-  const answer = await client.post(SEARCH_PATH, {
+  const answer = await client.post(SEARCH_PATH2, {
     jql,
     fields,
     maxResults: PAGE_SIZE,
@@ -576,24 +841,24 @@ async function searchPage(client, jql, fields, token) {
   const body = record(answer.value);
   const issues = body?.["issues"];
   if (body === void 0 || !Array.isArray(issues)) {
-    return shapeError(`POST ${SEARCH_PATH} answered no issues list`);
+    return shapeError(`POST ${SEARCH_PATH2} answered no issues list`);
   }
   const pulled = [];
   for (const issue of issues) {
     const checked = issueOf(issue);
     if (checked === void 0) {
-      return shapeError(`POST ${SEARCH_PATH} answered an issue without an id, a key or fields`);
+      return shapeError(`POST ${SEARCH_PATH2} answered an issue without an id, a key or fields`);
     }
     pulled.push(checked);
   }
   const next = body["nextPageToken"];
   if (next !== void 0 && next !== null && (typeof next !== "string" || next === "")) {
-    return shapeError(`POST ${SEARCH_PATH} answered a nextPageToken that is not text`);
+    return shapeError(`POST ${SEARCH_PATH2} answered a nextPageToken that is not text`);
   }
   const nextPageToken = typeof next === "string" ? next : void 0;
   const isLast = body["isLast"];
   if (isLast !== void 0 && typeof isLast !== "boolean") {
-    return shapeError(`POST ${SEARCH_PATH} answered an isLast that is not true or false`);
+    return shapeError(`POST ${SEARCH_PATH2} answered an isLast that is not true or false`);
   }
   return jiraOk({
     issues: pulled,
@@ -701,44 +966,80 @@ async function pullPage(host, request) {
   }
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return failed(verbFailed(config.error));
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return failed(verbFailed(mapped.error));
   const client = createJiraClient({
     fetch: (url, init) => host.fetch(url, init),
     config: config.value
   });
   const jql = await jqlOf(client, asked.selector);
   if (!jql.ok) return failed(verbFailed(jql.error));
-  const fields = FIXED_FIELDS;
-  const requestPrint = fingerprint(JSON.stringify([config.value.baseUrl, jql.value, fields]));
-  if (cursor !== void 0 && cursor.f !== requestPrint) {
-    return failed(
-      verbFailed({
-        code: "E_JIRA_CONFIG",
-        message: "the jira section changed during the pull; run again"
-      })
-    );
+  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
+  const requestPrint = fingerprint(
+    JSON.stringify([config.value.baseUrl, jql.value, fields, mapped.value])
+  );
+  const changed = verbFailed({
+    code: "E_JIRA_CONFIG",
+    message: "the jira section changed during the pull; run again"
+  });
+  if (cursor !== void 0 && cursor.f !== requestPrint) return failed(changed);
+  let types;
+  if (cursor === void 0) {
+    const read2 = await mappedTypes(client, mapped.value);
+    if (!read2.ok) return failed(verbFailed(read2.error));
+    types = read2.value;
+  } else {
+    if (!sameColumns(cursor.m, mapped.value)) return failed(changed);
+    types = cursor.m;
   }
-  const page = await searchPage(client, jql.value, fields, cursor?.t);
-  if (!page.ok) return failed(verbFailed(page.error));
-  const parents = await parentDescriptions(client, page.value.issues);
-  if (!parents.ok) return failed(verbFailed(parents.error));
-  const fetchedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const call = {
+    baseUrl: config.value.baseUrl,
+    email: config.value.email,
+    jql: jql.value,
+    fields,
+    pageSize: PAGE_SIZE,
+    token: cursor?.t,
+    page: cursor?.p ?? 1
+  };
+  const now = Date.now();
+  let read;
+  let generation = cursor?.g ?? now;
+  let fetchedAt = new Date(now).toISOString();
+  let fromCache = false;
+  const cached = request.refresh === true ? void 0 : await readCache(host, call, cursor?.g, now);
+  if (cached !== void 0) {
+    const replayed = await readPage(replayingClient(cached.raw), call);
+    if (replayed.ok) {
+      read = replayed.value;
+      generation = cached.gen;
+      fetchedAt = cached.storedAt;
+      fromCache = true;
+    }
+  }
+  if (read === void 0) {
+    const recorder = recordingClient(client);
+    const live = await readPage(recorder.client, call);
+    if (!live.ok) return failed(verbFailed(live.error));
+    read = live.value;
+    await writeCache(host, call, generation, recorder.raw());
+  }
   const rows = [];
-  for (const issue of page.value.issues) {
-    const comments = await commentBodies(client, issue);
-    if (!comments.ok) return failed(verbFailed(comments.error));
+  for (const [index, issue] of read.page.issues.entries()) {
     const parentKey = record(issue.fields["parent"])?.["key"];
-    const parent = typeof parentKey === "string" ? parents.value.get(parentKey) : void 0;
+    const parent = typeof parentKey === "string" ? read.parents.get(parentKey) : void 0;
     const row = rowOf(issue, {
       baseUrl: config.value.baseUrl,
       fetchedAt,
-      commentBodies: comments.value,
+      commentBodies: read.comments[index] ?? [],
       parentDescription: parent
     });
     if (!row.ok) return failed(verbFailed(row.error));
-    rows.push(row.value);
+    const values = mappedValues(issue.fields, issue.key, mapped.value, types);
+    if (!values.ok) return failed(verbFailed(values.error));
+    rows.push({ ...row.value, values: { ...row.value.values, ...values.value } });
   }
-  const table = { columns: FIXED_COLUMNS, rows };
-  const { isLast, nextPageToken } = page.value;
+  const table = { columns: [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types)], rows };
+  const { isLast, nextPageToken } = read.page;
   const total = (cursor?.n ?? 0) + rows.length;
   const truncated = total > asked.max || !isLast && total === asked.max || !isLast && nextPageToken === void 0;
   if (truncated) return { ok: true, value: { table, truncated: true }, diagnostics: [] };
@@ -752,11 +1053,24 @@ async function pullPage(host, request) {
     n: total,
     p: (cursor?.p ?? 1) + 1,
     f: requestPrint,
-    m: {},
-    g: 0,
-    c: false
+    m: types,
+    g: generation,
+    c: fromCache
   });
   return { ok: true, value: { table, cursor: next }, diagnostics: [] };
+}
+async function readPage(client, call) {
+  const page = await searchPage(client, call.jql, call.fields, call.token);
+  if (!page.ok) return page;
+  const parents = await parentDescriptions(client, page.value.issues);
+  if (!parents.ok) return parents;
+  const comments = [];
+  for (const issue of page.value.issues) {
+    const bodies = await commentBodies(client, issue);
+    if (!bodies.ok) return bodies;
+    comments.push(bodies.value);
+  }
+  return { ok: true, value: { page: page.value, parents: parents.value, comments } };
 }
 function readRequest(values) {
   const given = SELECTORS.filter((name) => values[name] !== void 0);

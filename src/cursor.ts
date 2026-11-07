@@ -8,9 +8,10 @@ import { base64 } from './http.js';
  * page number. `f` fingerprints the request the first page made, so a later page made from a
  * changed section is refused instead of stitched onto the earlier ones.
  *
- * `m`, `g` and `c` are written now and read by nothing yet: the mapped columns' types, the
- * cache generation and whether the page came from the cache belong to the `fields:` mapping
- * and the cache (TYTO-386 PR 3b), which then need no new cursor version.
+ * `m` is the mapped columns' types, read off the field catalogue by the first page only. `g` is
+ * the cache generation: the fill the first page came from, or the time it was read live, so a
+ * later page is taken from the cache only when it belongs to the same fill. `c` says whether
+ * the page before came from the cache.
  */
 export interface PullCursor {
   readonly v: 1;
@@ -22,8 +23,11 @@ export interface PullCursor {
   readonly p: number;
   /** {@link fingerprint} of the request. */
   readonly f: string;
+  /** Each mapped column's type, by column name. */
   readonly m: Readonly<Record<string, string>>;
+  /** The cache generation. */
   readonly g: number;
+  /** Whether the page before came from the cache. */
   readonly c: boolean;
 }
 
