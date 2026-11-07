@@ -7,10 +7,10 @@ and unlicensed.
 
 ## Status
 
-**It does nothing useful yet.** This is the scaffold: the manifest, two settings and the build.
-Not yet working, each its own pull request:
+**It does nothing useful yet.** It has the manifest, two settings, the build, and the HTTP
+client with its configuration (`src/http.ts`, `src/config.ts`), which no verb calls yet. Not
+yet working, each its own pull request:
 
-- the HTTP client, the auth check against `/myself` and the reading of the workspace section;
 - `jira.pull`, which pulls issues by JQL, board, keys or parent, page by page, into a table;
 - `jira.refresh`;
 - the user documentation and a check against a real site.
