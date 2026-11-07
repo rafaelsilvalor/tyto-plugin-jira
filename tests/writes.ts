@@ -14,6 +14,10 @@ export type InputTable = NonNullable<TestRecipeOptions['input']>;
 export interface FakeIssue {
   status: string;
   assignee: { accountId: string; displayName: string } | null;
+  /** Other fields, raw, by id, as `PUT /issue/{key}` sets them. */
+  fields?: Record<string, unknown>;
+  /** The issue's comments, oldest first. */
+  comments?: { author: { accountId: string }; body: unknown }[];
 }
 
 /** By status: the transitions Jira offers from it, as `[id, name, to]`. */
@@ -26,7 +30,7 @@ export const ME = { accountId: '557058:00000000-0000-4000-8000-000000000001', di
 export function jiraWrites(issues: Map<string, FakeIssue>, transitions: Transitions = {}): Route {
   return (call: JiraCall): FetchedResponse | undefined => {
     if (call.method === 'POST' && call.path === SEARCH) {
-      const jql = (call.body as { jql: string }).jql;
+      const { jql, fields: asked } = call.body as { jql: string; fields: string[] };
       const keys = /^key in \(([^)]*)\)$/.exec(jql)?.[1]?.split(', ') ?? [];
       const found = keys.flatMap((key) => {
         const issue = issues.get(key);
@@ -39,6 +43,9 @@ export function jiraWrites(issues: Map<string, FakeIssue>, transitions: Transiti
               status: { name: issue.status },
               assignee: issue.assignee,
               updated: '2026-11-01T00:00:00.000+0000',
+              ...Object.fromEntries(
+                Object.entries(issue.fields ?? {}).filter(([id]) => asked.includes(id)),
+              ),
             },
           },
         ];
@@ -46,6 +53,27 @@ export function jiraWrites(issues: Map<string, FakeIssue>, transitions: Transiti
       return response(200, { issues: found, isLast: true });
     }
     if (call.method === 'GET' && call.path === '/rest/api/3/myself') return response(200, ME);
+    const edited = /^\/rest\/api\/3\/issue\/([^/]+)(\/comment)?$/.exec(call.path);
+    const target =
+      edited?.[1] === undefined ? undefined : issues.get(decodeURIComponent(edited[1]));
+    if (edited !== null && target !== undefined) {
+      if (edited[2] === undefined && call.method === 'PUT') {
+        target.fields = { ...target.fields, ...(call.body as { fields: object }).fields };
+        return response(204);
+      }
+      const comments = (target.comments ??= []);
+      if (edited[2] !== undefined && call.method === 'GET') {
+        const newest = [...comments].reverse().slice(0, Number(call.query['maxResults'] ?? 50));
+        return response(200, { comments: newest, total: comments.length });
+      }
+      if (edited[2] !== undefined && call.method === 'POST') {
+        comments.push({
+          author: { accountId: ME.accountId },
+          body: (call.body as { body: unknown }).body,
+        });
+        return response(201, { id: String(comments.length) });
+      }
+    }
     const match = /^\/rest\/api\/3\/issue\/([^/]+)\/(transitions|assignee)$/.exec(call.path);
     const key = match?.[1] === undefined ? undefined : decodeURIComponent(match[1]);
     const issue = key === undefined ? undefined : issues.get(key);
@@ -77,7 +105,7 @@ export function jiraWrites(issues: Map<string, FakeIssue>, transitions: Transiti
 export function pulled(
   rows: readonly (readonly [key: string, status: string | null, assignee?: string | null])[],
   extra: InputTable['columns'] = [],
-  values: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {},
+  values: Readonly<Record<string, InputTable['rows'][number]['values']>> = {},
 ): InputTable {
   return {
     columns: [

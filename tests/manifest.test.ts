@@ -46,7 +46,7 @@ describe('tyto-plugin.json', () => {
 
   it('declares only the kinds of write a verb of this version plans', async () => {
     const plugin = await harness();
-    expect(plugin.manifest.writes).toEqual(['transition', 'assign']);
+    expect(plugin.manifest.writes).toEqual(['transition', 'assign', 'field', 'comment']);
     const declared = plugin.host.registry
       .recipeVerbs()
       .flatMap((verb) => verb.writes ?? [])
@@ -66,7 +66,7 @@ describe('tyto-plugin.json', () => {
 });
 
 describe('activate', () => {
-  it('declares two settings with no default, two reading verbs and two actions', async () => {
+  it('declares two settings with no default, two reading verbs and four actions', async () => {
     const plugin = await harness();
     const declared = plugin.host.registry.configurations();
     expect(declared.map((setting) => setting.key)).toEqual(['jira.baseUrl', 'jira.email']);
@@ -104,6 +104,15 @@ describe('activate', () => {
         ],
       ],
       ['jira.assign', 'action', [{ name: 'to', type: 'text', required: true }]],
+      [
+        'jira.set',
+        'action',
+        [
+          { name: 'field', type: 'text', required: true },
+          { name: 'value', type: 'text', required: true },
+        ],
+      ],
+      ['jira.comment', 'action', [{ name: 'body', type: 'text', required: true }]],
     ]);
     await plugin.close();
   });
@@ -132,7 +141,7 @@ describe('activate', () => {
     });
     expect(activated.ok).toBe(true);
     expect(host.registry.configurations()).toHaveLength(2);
-    expect(host.registry.recipeVerbs()).toHaveLength(4);
+    expect(host.registry.recipeVerbs()).toHaveLength(6);
     registered?.dispose();
     expect(host.registry.configurations()).toEqual([]);
     expect(host.registry.recipeVerbs()).toEqual([]);

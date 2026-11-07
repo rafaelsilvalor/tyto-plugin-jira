@@ -32,6 +32,8 @@ export const VERB_ID = 'jira.pull';
 export const REFRESH_VERB_ID = 'jira.refresh';
 export const TRANSITION_VERB_ID = 'jira.transition';
 export const ASSIGN_VERB_ID = 'jira.assign';
+export const SET_VERB_ID = 'jira.set';
+export const COMMENT_VERB_ID = 'jira.comment';
 
 /**
  * A Jira failure in Tyto's words. Tyto's catalogue is closed, so the plugin's own code

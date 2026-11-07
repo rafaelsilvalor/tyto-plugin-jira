@@ -1,15 +1,17 @@
 import type { Disposable, PluginHost } from '@tyto/plugin-api';
 
 import { assignVerb } from './assign.js';
+import { commentVerb } from './comment.js';
 import { pullVerb } from './pull.js';
 import { refreshVerb } from './refresh.js';
+import { setVerb } from './set.js';
 import { SETTINGS } from './settings.js';
 import { transitionVerb } from './transition.js';
 
 /**
  * Declares the plugin's settings and its recipe verbs: the `jira.pull` source, the
- * `jira.refresh` transform, and the `jira.transition` and `jira.assign` actions, which plan
- * and write only when a person applies the plan.
+ * `jira.refresh` transform, and the `jira.transition`, `jira.assign`, `jira.set` and
+ * `jira.comment` actions, which plan and write only when a person applies the plan.
  *
  * Nothing is read at activation: the site, the email and the token are resolved on every call
  * of a verb, from the section the call carries, so a folder or a credential changed between
@@ -22,6 +24,8 @@ export function activate(host: PluginHost): Disposable {
     host.registerRecipeVerb(refreshVerb(host)),
     host.registerRecipeVerb(transitionVerb(host)),
     host.registerRecipeVerb(assignVerb(host)),
+    host.registerRecipeVerb(setVerb(host)),
+    host.registerRecipeVerb(commentVerb(host)),
   ];
   return {
     dispose() {

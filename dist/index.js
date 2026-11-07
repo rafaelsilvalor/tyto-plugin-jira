@@ -133,6 +133,8 @@ var VERB_ID = "jira.pull";
 var REFRESH_VERB_ID = "jira.refresh";
 var TRANSITION_VERB_ID = "jira.transition";
 var ASSIGN_VERB_ID = "jira.assign";
+var SET_VERB_ID = "jira.set";
+var COMMENT_VERB_ID = "jira.comment";
 function verbFailed(error, verb = VERB_ID) {
   return {
     severity: "error",
@@ -140,11 +142,11 @@ function verbFailed(error, verb = VERB_ID) {
     message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
   };
 }
-function argumentsProblem(problem4, verb = VERB_ID) {
+function argumentsProblem(problem6, verb = VERB_ID) {
   return {
     severity: "error",
     code: "E_RECIPE_ARGUMENTS",
-    message: `'${verb}' ${withoutFinalStop(problem4)}.`
+    message: `'${verb}' ${withoutFinalStop(problem6)}.`
   };
 }
 function failed(diagnostic) {
@@ -550,7 +552,7 @@ async function commentBodies(client, issue) {
   const comments = Array.isArray(embedded?.["comments"]) ? embedded["comments"] : [];
   const total = embedded?.["total"];
   if (typeof total !== "number" || total <= comments.length) {
-    return jiraOk(comments.map((comment) => record(comment)?.["body"]));
+    return jiraOk(comments.map((comment2) => record(comment2)?.["body"]));
   }
   const path = `/rest/api/3/issue/${encodeURIComponent(issue.key)}/comment`;
   const bodies = [];
@@ -564,7 +566,7 @@ async function commentBodies(client, issue) {
     const answered2 = record(page.value)?.["comments"];
     if (!Array.isArray(answered2)) return shapeError(`GET ${path} answered no comments list`);
     if (answered2.length === 0) break;
-    bodies.push(...answered2.map((comment) => record(comment)?.["body"]));
+    bodies.push(...answered2.map((comment2) => record(comment2)?.["body"]));
   }
   return jiraOk(bodies);
 }
@@ -765,10 +767,10 @@ function recordingClient(client) {
   let parents = null;
   const comments = {};
   const kept = (path, value) => {
-    const comment = COMMENT_PATH.exec(path)?.[1];
+    const comment2 = COMMENT_PATH.exec(path)?.[1];
     if (path === SEARCH_PATH2) search = value;
     else if (path === BULK_PATH) parents = value;
-    else if (comment !== void 0) (comments[comment] ??= []).push(value);
+    else if (comment2 !== void 0) (comments[comment2] ??= []).push(value);
   };
   return {
     client: {
@@ -936,8 +938,8 @@ function textOf(value) {
   const object = record(value);
   if (object?.["type"] === "doc") return documentText(object);
   for (const name of ["value", "name", "displayName"]) {
-    const shown = object?.[name];
-    if (typeof shown === "string") return shown;
+    const shown2 = object?.[name];
+    if (typeof shown2 === "string") return shown2;
   }
   return JSON.stringify(value) ?? "";
 }
@@ -951,6 +953,15 @@ function documentText(document) {
   };
   const blocks = Array.isArray(document["content"]) ? document["content"] : [];
   return blocks.map(inline).filter((line) => line !== "").join("\n");
+}
+function projected(value) {
+  if (value === void 0 || value === null || value === "") return null;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    return value.map((item) => typeof item === "number" ? item : textOf(item));
+  }
+  if (typeof value === "number") return value;
+  return textOf(value);
 }
 function configError(message) {
   return jiraError("E_JIRA_CONFIG", `${message}.`);
@@ -1236,7 +1247,8 @@ async function applyBatch(host, request, verb, clock = systemClock) {
       decoded.flatMap((each) => typeof each === "object" && "k" in each ? [each.k] : [])
     )
   ];
-  const read = keys.length === 0 ? jiraOk(/* @__PURE__ */ new Map()) : await currentIssues(client, keys);
+  const extra = verb.fields?.(decoded.filter((each) => typeof each === "object")) ?? [];
+  const read = keys.length === 0 ? jiraOk(/* @__PURE__ */ new Map()) : await currentIssues(client, keys, extra);
   const context = read.ok ? { client, config: config.value, current: read.value } : void 0;
   let refused2;
   const outcomes = [];
@@ -1284,12 +1296,13 @@ function decodeOperation(payload, verb) {
   return verb.decode(object) ?? UNREADABLE;
 }
 var UNREADABLE = "E_JIRA_PLAN: this operation carries no payload this version of the plugin reads; run the cell again";
-async function currentIssues(client, keys) {
+async function currentIssues(client, keys, extra) {
   const found = /* @__PURE__ */ new Map();
   const jql = `key in (${keys.join(", ")})`;
+  const fields = [.../* @__PURE__ */ new Set([...DRIFT_FIELDS, ...extra])];
   let token;
   for (; ; ) {
-    const page = await searchPage(client, jql, DRIFT_FIELDS, token);
+    const page = await searchPage(client, jql, fields, token);
     if (!page.ok) return page;
     for (const issue of page.value.issues) {
       const status = record(issue.fields["status"])?.["name"];
@@ -1301,7 +1314,8 @@ async function currentIssues(client, keys) {
         key: issue.key,
         status: typeof status === "string" ? status : null,
         assignee: typeof accountId === "string" ? { accountId, displayName: typeof displayName === "string" ? displayName : null } : null,
-        updated: typeof updated === "string" ? updated : null
+        updated: typeof updated === "string" ? updated : null,
+        fields: Object.fromEntries(extra.map((id) => [id, issue.fields[id] ?? null]))
       });
     }
     const next = page.value.nextPageToken;
@@ -1482,12 +1496,152 @@ function problem(text2) {
   return argumentsProblem(text2, ASSIGN_VERB_ID);
 }
 
+// src/write/adf.ts
+var PARAGRAPH_BREAK = /\n[ \t]*\n+/;
+var ADDRESS = /https?:\/\/[^\s<>"]+/g;
+var TRAILING = /[.,;:!?)\]'"]+$/;
+function textToAdf(text2) {
+  const paragraphs = text2.replace(/\r\n?/g, "\n").split(PARAGRAPH_BREAK).map((paragraph) => paragraph.replace(/^\n+|\n+$/g, "")).filter((paragraph) => paragraph.trim() !== "");
+  return {
+    type: "doc",
+    version: 1,
+    content: paragraphs.map((paragraph) => ({
+      type: "paragraph",
+      content: paragraph.split("\n").flatMap(
+        (line, index) => index === 0 ? linked(line) : [{ type: "hardBreak" }, ...linked(line)]
+      )
+    }))
+  };
+}
+function linked(line) {
+  const nodes = [];
+  let from = 0;
+  for (const match of line.matchAll(ADDRESS)) {
+    const address = match[0].replace(TRAILING, "");
+    const start = match.index;
+    if (start > from) nodes.push({ type: "text", text: line.slice(from, start) });
+    nodes.push({
+      type: "text",
+      text: address,
+      marks: [{ type: "link", attrs: { href: address } }]
+    });
+    from = start + address.length;
+  }
+  if (from < line.length) nodes.push({ type: "text", text: line.slice(from) });
+  return nodes;
+}
+
+// src/comment.ts
+var COMMENT_WRITE = "comment";
+var MAX_COMMENT_BYTES = 1500;
+var RECENT_COMMENTS = 50;
+var ARGUMENTS3 = [{ name: "body", type: "text", required: true }];
+function commentVerb(host, clock = systemClock) {
+  return {
+    id: COMMENT_VERB_ID,
+    kind: "action",
+    arguments: ARGUMENTS3,
+    writes: [COMMENT_WRITE],
+    plan: (request) => planComments(host, request),
+    apply: (request) => applyComments(host, request, clock)
+  };
+}
+async function planComments(host, request) {
+  const { table } = request;
+  const written = String(request.arguments["body"] ?? "").trim();
+  const column = columnNamed(table, written);
+  if (column === void 0) {
+    return planRefused(problem2(`body= names '${written}', which is not a column of the table`));
+  }
+  if (column.type !== "text") {
+    return planRefused(
+      problem2(`body= names ${column.name}, a ${column.type} column; a comment is text`)
+    );
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return planRefused(verbFailed(config.error, COMMENT_VERB_ID));
+  const operations = [];
+  for (const row of table.rows) {
+    const key = issueKeyOf(row);
+    const fail = (reason) => {
+      operations.push(plannedFailure(COMMENT_WRITE, row.key, `${key ?? row.key}: comment`, reason));
+    };
+    if (key === void 0) {
+      fail(`E_JIRA_PLAN: row ${row.key} names no issue key in its key column or its key`);
+      continue;
+    }
+    const value = row.values[column.name];
+    const text2 = typeof value === "string" ? value.trim() : "";
+    if (text2 === "") {
+      fail(`E_JIRA_PLAN: ${key} has no text in ${column.name}`);
+      continue;
+    }
+    const bytes = new TextEncoder().encode(text2).byteLength;
+    if (bytes > MAX_COMMENT_BYTES) {
+      fail(
+        `E_JIRA_PLAN: ${key}'s comment is ${bytes.toLocaleString("en-US")} bytes, over the ${MAX_COMMENT_BYTES.toLocaleString("en-US")} a plan carries; shorten it`
+      );
+      continue;
+    }
+    const preview = shortened(text2.replace(/\s+/g, " "), 80);
+    operations.push(
+      plannedOperation(COMMENT_WRITE, row.key, `${key}: comment "${preview}"`, { k: key, b: text2 })
+    );
+  }
+  return planOf(`Jira ${new URL(config.value.baseUrl).hostname}`, operations);
+}
+function applyComments(host, request, clock = systemClock) {
+  let me;
+  return applyBatch(
+    host,
+    request,
+    {
+      decode: decode2,
+      async write(planned, _issue, context) {
+        if (me === void 0) {
+          const account = await context.client.myself();
+          if (!account.ok) return failedWith(account.error);
+          me = account.value.accountId;
+        }
+        return comment(planned, me, context);
+      }
+    },
+    clock
+  );
+}
+function decode2(payload) {
+  const { k, b } = payload;
+  return typeof k === "string" && typeof b === "string" ? { k, b } : void 0;
+}
+async function comment(planned, me, context) {
+  const path = `/rest/api/3/issue/${encodeURIComponent(planned.k)}/comment`;
+  const body = textToAdf(planned.b);
+  const wanted = fingerprint(textOf(body));
+  const recent = await context.client.get(path, {
+    orderBy: "-created",
+    maxResults: RECENT_COMMENTS
+  });
+  if (!recent.ok) return failedWith(recent.error);
+  const comments = record(recent.value)?.["comments"];
+  const left = (Array.isArray(comments) ? comments : []).some((each) => {
+    const existing = record(each);
+    return record(existing?.["author"])?.["accountId"] === me && fingerprint(textOf(existing?.["body"] ?? "")) === wanted;
+  });
+  if (left) return { status: "applied", reason: "already commented; nothing written" };
+  const posted = await context.client.post(path, { body });
+  if (!posted.ok) return failedWith(posted.error);
+  return { status: "applied" };
+}
+function problem2(text2) {
+  return argumentsProblem(text2, COMMENT_VERB_ID);
+}
+
 // src/refresh.ts
 var MAX_KEYS = 1e3;
 var MAX_CHILDREN = 5e3;
 var BUDGET_MILLISECONDS = 25e3;
 var PARENTS_PER_SEARCH = 100;
-var ARGUMENTS3 = [
+var ARGUMENTS4 = [
   { name: "by", type: "text" },
   { name: "only", type: "text" },
   { name: "children", type: "boolean" }
@@ -1497,7 +1651,7 @@ function refreshVerb(host, clock = systemClock2) {
   return {
     id: REFRESH_VERB_ID,
     kind: "transform",
-    arguments: ARGUMENTS3,
+    arguments: ARGUMENTS4,
     transform: (request) => refreshTable(host, request, clock)
   };
 }
@@ -1514,7 +1668,7 @@ async function refreshTable(host, request, clock = systemClock2) {
   ]);
   if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
     return refused(
-      problem2(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
+      problem3(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
     );
   }
   const keyOf = (row) => {
@@ -1565,7 +1719,7 @@ async function refreshTable(host, request, clock = systemClock2) {
     const column = existing.get(target.name);
     if (column !== void 0 && column.type !== target.type) {
       return refused(
-        problem2(
+        problem3(
           `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
         )
       );
@@ -1638,7 +1792,7 @@ async function refreshTable(host, request, clock = systemClock2) {
     if (present.has(key)) continue;
     if (rowKeys.has(key)) {
       return refused(
-        problem2(
+        problem3(
           `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
         )
       );
@@ -1657,17 +1811,17 @@ function readArguments(request) {
     const written = request.arguments[name];
     if (written === void 0) return void 0;
     const column = columns.get(String(written).trim().toLowerCase());
-    return column ?? problem2(`${name}= names '${String(written)}', which is not a column of the table`);
+    return column ?? problem3(`${name}= names '${String(written)}', which is not a column of the table`);
   };
   const by = columnOf("by");
   if (by !== void 0 && "severity" in by) return by;
   if (by !== void 0 && by.type !== "text") {
-    return problem2(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
+    return problem3(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
   }
   const only = columnOf("only");
   if (only !== void 0 && "severity" in only) return only;
   if (only !== void 0 && only.type !== "boolean") {
-    return problem2(
+    return problem3(
       `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
     );
   }
@@ -1722,7 +1876,7 @@ async function childrenOf(client, parents, fields) {
   }
   return jiraOk(children);
 }
-function problem2(text2) {
+function problem3(text2) {
   return argumentsProblem(text2, REFRESH_VERB_ID);
 }
 function narrow(what) {
@@ -1742,6 +1896,294 @@ function count(value) {
   return value.toLocaleString("en-US");
 }
 var wait2 = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// src/write/catalogue.ts
+var FIELD_CATALOGUE2 = "/rest/api/3/field";
+function catalogueKey(config) {
+  return `jira/field/v1/${new URL(config.baseUrl).host}/${fingerprint(config.email)}`;
+}
+async function fieldCatalogue(host, client, config, now) {
+  const key = catalogueKey(config);
+  try {
+    const stored = await host.cache.get(key);
+    const age = stored === void 0 ? NaN : now - Date.parse(stored.storedAt);
+    const fields2 = stored === void 0 ? void 0 : entryOf2(stored.bytes);
+    if (stored !== void 0 && fields2 === void 0) {
+      host.log.warn("jira.set ignored a field catalogue entry it did not write");
+    } else if (fields2 !== void 0 && age >= 0 && age < FRESH_MILLISECONDS) {
+      return jiraOk(fields2);
+    }
+  } catch (thrown) {
+    host.log.warn(`jira.set read no cached field catalogue: ${messageOf(thrown)}`);
+  }
+  const answer = await client.get(FIELD_CATALOGUE2);
+  if (!answer.ok) return answer;
+  if (!Array.isArray(answer.value)) {
+    return jiraError("E_JIRA_RESPONSE", `GET ${FIELD_CATALOGUE2} answered no list of fields.`);
+  }
+  const fields = answer.value.flatMap((each) => fieldOf(each) ?? []);
+  try {
+    await host.cache.put(key, new TextEncoder().encode(JSON.stringify({ v: 1, fields })));
+  } catch (thrown) {
+    host.log.warn(`jira.set cached no field catalogue: ${messageOf(thrown)}`);
+  }
+  return jiraOk(fields);
+}
+function fieldOf(value) {
+  const field = record(value);
+  const id = field?.["id"];
+  if (typeof id !== "string") return void 0;
+  const name = field?.["name"];
+  const schema = record(field?.["schema"]);
+  const text2 = (key) => typeof schema?.[key] === "string" ? { [key]: schema[key] } : {};
+  return {
+    id,
+    name: typeof name === "string" ? name : id,
+    schema: { ...text2("type"), ...text2("items"), ...text2("custom") }
+  };
+}
+function entryOf2(bytes) {
+  let parsed;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return void 0;
+  }
+  const entry = record(parsed);
+  const fields = entry?.["fields"];
+  if (entry?.["v"] !== 1 || !Array.isArray(fields)) return void 0;
+  const read = fields.map(fieldOf);
+  return read.every((field) => field !== void 0) ? read : void 0;
+}
+
+// src/set.ts
+var SET_WRITE = "field";
+var ARGUMENTS5 = [
+  { name: "field", type: "text", required: true },
+  { name: "value", type: "text", required: true }
+];
+var BUILT_IN = {
+  summary: { type: "string" },
+  labels: { type: "array", items: "string" },
+  duedate: { type: "date" },
+  priority: { type: "priority" }
+};
+var TEXTAREA = ":textarea";
+var DATE = /^\d{4}-\d{2}-\d{2}$/;
+function setVerb(host, clock = systemClock) {
+  return {
+    id: SET_VERB_ID,
+    kind: "action",
+    arguments: ARGUMENTS5,
+    writes: [SET_WRITE],
+    plan: (request) => planSets(host, request, clock),
+    apply: (request) => applySets(host, request, clock)
+  };
+}
+async function planSets(host, request, clock = systemClock) {
+  const { table } = request;
+  const field = String(request.arguments["field"] ?? "").trim();
+  const valueName = String(request.arguments["value"] ?? "").trim();
+  const valueColumn = columnNamed(table, valueName);
+  if (valueColumn === void 0) {
+    return planRefused(problem4(`value= names '${valueName}', which is not a column of the table`));
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return planRefused(verbFailed(config.error, SET_VERB_ID));
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return planRefused(verbFailed(mapped.error, SET_VERB_ID));
+  const name = field.toLowerCase();
+  const mapping = mapped.value.find((each) => each.column === name);
+  let schema = BUILT_IN[name];
+  let id = name;
+  if (mapping !== void 0) {
+    const client = createJiraClient({ config: config.value, fetch: host.fetch });
+    const catalogue = await fieldCatalogue(host, client, config.value, clock.now());
+    if (!catalogue.ok) return planRefused(verbFailed(catalogue.error, SET_VERB_ID));
+    const found = catalogue.value.find((each) => each.id === mapping.id);
+    if (found === void 0) {
+      return planRefused(
+        problem4(`field= names ${name}, mapped to ${mapping.id}, and this site has no such field`)
+      );
+    }
+    schema = found.schema;
+    id = mapping.id;
+  }
+  if (schema === void 0) {
+    return planRefused(
+      problem4(
+        `field= names '${field}', which is neither a column the fields of the jira section map nor summary, labels, duedate or priority`
+      )
+    );
+  }
+  const kind = kindOf(schema);
+  if (kind === void 0) {
+    const type = schema.items === void 0 ? schema.type : `${schema.type} of ${schema.items}`;
+    return planRefused(
+      problem4(`field= names ${name}, a field of type ${type ?? "unknown"}, which it cannot write`)
+    );
+  }
+  const target = { id, name, kind };
+  const before = columnNamed(table, name);
+  const operations = [];
+  for (const row of table.rows) {
+    const key = issueKeyOf(row);
+    if (key === void 0) {
+      operations.push(
+        plannedFailure(
+          SET_WRITE,
+          row.key,
+          `${row.key}: set ${name}`,
+          `E_JIRA_PLAN: row ${row.key} names no issue key in its key column or its key`
+        )
+      );
+      continue;
+    }
+    const value = converted(target, row.values[valueColumn.name] ?? null);
+    if (typeof value === "string") {
+      operations.push(
+        plannedFailure(SET_WRITE, row.key, `${key}: set ${name}`, `E_JIRA_PLAN: ${key}: ${value}`)
+      );
+      continue;
+    }
+    const from = before === void 0 ? void 0 : projected(row.values[before.name] ?? null);
+    const change = from === void 0 ? shown(value.v) : `${shown(from)} \u2192 ${shown(value.v)}`;
+    operations.push(
+      plannedOperation(SET_WRITE, row.key, `${key}: ${name} ${change}`, {
+        k: key,
+        fid: id,
+        ...from === void 0 ? {} : { h: hashOf(from) },
+        v: value.v
+      })
+    );
+  }
+  return planOf(`Jira ${new URL(config.value.baseUrl).hostname}`, operations);
+}
+function kindOf(schema) {
+  switch (schema.type) {
+    case "string":
+      return schema.custom?.endsWith(TEXTAREA) === true ? "textarea" : "text";
+    case "number":
+    case "date":
+    case "option":
+    case "user":
+    case "priority":
+      return schema.type;
+    case "array":
+      if (schema.items === "string") return "labels";
+      if (schema.items === "option") return "options";
+      return void 0;
+    default:
+      return void 0;
+  }
+}
+function converted(target, cell) {
+  const empty = projected(cell) === null;
+  const text2 = Array.isArray(cell) ? cell.map(String).join(", ") : String(cell ?? "").trim();
+  switch (target.kind) {
+    case "labels":
+    case "options": {
+      const items = (Array.isArray(cell) ? cell.map(String) : text2.split(",")).flatMap(
+        (item) => target.kind === "labels" ? item.split(/[\s,]+/) : [item]
+      );
+      const kept = items.map((item) => item.trim()).filter((item) => item !== "");
+      return { v: target.kind === "labels" ? kept : kept.map((value) => ({ value })) };
+    }
+    case "text":
+      if (empty && target.id === "summary") return "a summary cannot be empty";
+      return { v: empty ? null : text2 };
+    case "textarea":
+      return { v: empty ? null : textToAdf(text2) };
+    case "number": {
+      if (empty) return { v: null };
+      const number = typeof cell === "number" ? cell : Number(text2);
+      if (text2 === "" || !Number.isFinite(number)) {
+        return `${JSON.stringify(text2.slice(0, 80))} is not a number for ${target.name}`;
+      }
+      return { v: number };
+    }
+    case "date":
+      if (empty) return { v: null };
+      if (!DATE.test(text2)) {
+        return `${JSON.stringify(text2.slice(0, 80))} is not a date, such as 2026-10-01, for ${target.name}`;
+      }
+      return { v: text2 };
+    case "option":
+      return { v: empty ? null : { value: text2 } };
+    case "priority":
+      if (empty) return "a priority cannot be empty";
+      return { v: { name: text2 } };
+    case "user":
+      if (empty) return { v: null };
+      if (!ACCOUNT_ID.test(text2)) {
+        return `${JSON.stringify(text2.slice(0, 80))} is not a Jira account id for ${target.name}; write the id, not a name or an email`;
+      }
+      return { v: { accountId: text2 } };
+  }
+}
+function shown(value) {
+  const accountId = record(value)?.["accountId"];
+  const cell = projected(value);
+  const text2 = typeof accountId === "string" ? accountId : Array.isArray(cell) ? cell.join(", ") : textOf(cell ?? "(empty)");
+  return shortened(text2, 80);
+}
+function hashOf(cell) {
+  return fingerprint(JSON.stringify(cell));
+}
+function applySets(host, request, clock = systemClock) {
+  return applyBatch(
+    host,
+    request,
+    {
+      decode: decode3,
+      fields: (planned) => planned.map((each) => each.fid),
+      write: set
+    },
+    clock
+  );
+}
+function decode3(payload) {
+  const { k, fid, h, v } = payload;
+  if (typeof k !== "string" || typeof fid !== "string" || v === void 0) return void 0;
+  if (h !== void 0 && typeof h !== "string") return void 0;
+  return { k, fid, ...h === void 0 ? {} : { h }, v };
+}
+async function set(planned, issue, context) {
+  const { k: key, fid } = planned;
+  const now = issue.fields[fid] ?? null;
+  if (holds(now, planned.v)) {
+    return { status: "applied", reason: `already ${fid} = ${shown(now)}; nothing written` };
+  }
+  if (planned.h !== void 0 && hashOf(projected(now)) !== planned.h) {
+    return {
+      status: "failed",
+      reason: `E_JIRA_MOVED: ${key}'s ${fid} is ${shown(now)} now, not what the table read when planned; run the cell again`
+    };
+  }
+  const put = await context.client.put(`/rest/api/3/issue/${encodeURIComponent(key)}`, {
+    fields: { [fid]: planned.v }
+  });
+  if (!put.ok) return failedWith(put.error);
+  issue.fields[fid] = planned.v;
+  return { status: "applied" };
+}
+function holds(current, wanted) {
+  if (wanted === null) return projected(current) === null;
+  if (Array.isArray(wanted)) {
+    const items = Array.isArray(current) ? current : [];
+    return items.length === wanted.length && wanted.every((each) => items.some((item) => holds(item, each)));
+  }
+  const object = record(wanted);
+  if (object === void 0) return current === wanted;
+  if (object["type"] === "doc") return projected(current) === projected(wanted);
+  for (const name of ["accountId", "value", "name"]) {
+    if (typeof object[name] === "string") return record(current)?.[name] === object[name];
+  }
+  return false;
+}
+function problem4(text2) {
+  return argumentsProblem(text2, SET_VERB_ID);
+}
 
 // src/settings.ts
 var SETTINGS = [
@@ -1831,7 +2273,7 @@ function configError2(message) {
 
 // src/transition.ts
 var TRANSITION_WRITE = "transition";
-var ARGUMENTS4 = [
+var ARGUMENTS6 = [
   { name: "to", type: "text", required: true },
   { name: "workflow", type: "text" }
 ];
@@ -1840,7 +2282,7 @@ function transitionVerb(host, clock = systemClock) {
   return {
     id: TRANSITION_VERB_ID,
     kind: "action",
-    arguments: ARGUMENTS4,
+    arguments: ARGUMENTS6,
     writes: [TRANSITION_WRITE],
     plan: (request) => planTransitions(host, request),
     apply: (request) => applyTransitions(host, request, clock)
@@ -1849,7 +2291,7 @@ function transitionVerb(host, clock = systemClock) {
 async function planTransitions(host, request) {
   const { table } = request;
   const to = String(request.arguments["to"] ?? "").trim();
-  if (to === "") return planRefused(problem3("needs to=, the status to move each issue to"));
+  if (to === "") return planRefused(problem5("needs to=, the status to move each issue to"));
   const workflowName = request.arguments["workflow"];
   let workflow;
   if (workflowName !== void 0) {
@@ -1859,7 +2301,7 @@ async function planTransitions(host, request) {
     if (read.value === void 0) {
       const known = workflowNames(request.section);
       return planRefused(
-        problem3(
+        problem5(
           `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`)
         )
       );
@@ -1869,7 +2311,7 @@ async function planTransitions(host, request) {
   const status = columnNamed(table, "status");
   if (status === void 0) {
     return planRefused(
-      problem3("needs the status column jira.pull answers, to know where each issue starts")
+      problem5("needs the status column jira.pull answers, to know where each issue starts")
     );
   }
   const config = await resolveJiraConfig(host, request.section);
@@ -1939,9 +2381,9 @@ function unreachable(workflow, from, to, reached) {
   return `E_JIRA_CONFIG: workflow ${workflow} has no path from ${from} to ${to}; ${tried}`;
 }
 function applyTransitions(host, request, clock = systemClock) {
-  return applyBatch(host, request, { decode: decode2, write: walk }, clock);
+  return applyBatch(host, request, { decode: decode4, write: walk }, clock);
 }
-function decode2(payload) {
+function decode4(payload) {
   const { k, f, p } = payload;
   if (typeof k !== "string" || typeof f !== "string" || !Array.isArray(p) || p.length === 0) {
     return void 0;
@@ -2020,7 +2462,7 @@ async function transitionsOf(client, key) {
 function named(transition) {
   return `${transition.name} (to ${transition.to})`;
 }
-function problem3(text2) {
+function problem5(text2) {
   return argumentsProblem(text2, TRANSITION_VERB_ID);
 }
 
@@ -2031,7 +2473,9 @@ function activate(host) {
     host.registerRecipeVerb(pullVerb(host)),
     host.registerRecipeVerb(refreshVerb(host)),
     host.registerRecipeVerb(transitionVerb(host)),
-    host.registerRecipeVerb(assignVerb(host))
+    host.registerRecipeVerb(assignVerb(host)),
+    host.registerRecipeVerb(setVerb(host)),
+    host.registerRecipeVerb(commentVerb(host))
   ];
   return {
     dispose() {
