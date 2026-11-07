@@ -39,6 +39,8 @@ export interface CurrentIssue {
   status: string | null;
   assignee: { readonly accountId: string; readonly displayName: string | null } | null;
   readonly updated: string | null;
+  /** The fields a verb asked the search for besides those above, raw, by field id. */
+  readonly fields: Record<string, unknown>;
 }
 
 /** What one operation is handed besides its payload. */
@@ -52,6 +54,8 @@ export interface WriteContext {
 export interface WriteVerb<Decoded extends { readonly k: string }> {
   /** The payload as this verb planned it, or `undefined` when it is not one. */
   decode(payload: Payload): Decoded | undefined;
+  /** The fields the batch's search also reads, for this verb's drift checks. */
+  fields?(decoded: readonly Decoded[]): readonly string[];
   /** Writes one operation; the issue was found by the batch's search. */
   write(
     decoded: Decoded,
@@ -112,7 +116,8 @@ export async function applyBatch<Decoded extends { readonly k: string }>(
       decoded.flatMap((each) => (typeof each === 'object' && 'k' in each ? [each.k] : [])),
     ),
   ];
-  const read = keys.length === 0 ? jiraOk(new Map()) : await currentIssues(client, keys);
+  const extra = verb.fields?.(decoded.filter((each) => typeof each === 'object')) ?? [];
+  const read = keys.length === 0 ? jiraOk(new Map()) : await currentIssues(client, keys, extra);
   const context: WriteContext | undefined = read.ok
     ? { client, config: config.value, current: read.value }
     : undefined;
@@ -178,12 +183,14 @@ const UNREADABLE =
 async function currentIssues(
   client: JiraClient,
   keys: readonly string[],
+  extra: readonly string[],
 ): Promise<JiraResult<Map<string, CurrentIssue>>> {
   const found = new Map<string, CurrentIssue>();
   const jql = `key in (${keys.join(', ')})`;
+  const fields = [...new Set([...DRIFT_FIELDS, ...extra])];
   let token: string | undefined;
   for (;;) {
-    const page = await searchPage(client, jql, DRIFT_FIELDS, token);
+    const page = await searchPage(client, jql, fields, token);
     if (!page.ok) return page;
     for (const issue of page.value.issues) {
       const status = record(issue.fields['status'])?.['name'];
@@ -199,6 +206,7 @@ async function currentIssues(
             ? { accountId, displayName: typeof displayName === 'string' ? displayName : null }
             : null,
         updated: typeof updated === 'string' ? updated : null,
+        fields: Object.fromEntries(extra.map((id) => [id, issue.fields[id] ?? null])),
       });
     }
     const next = page.value.nextPageToken;

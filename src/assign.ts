@@ -40,7 +40,7 @@ const ARGUMENTS: readonly ArgumentSpec[] = [{ name: 'to', type: 'text', required
  * Jira Cloud's account ids: `557058:` and a UUID, or 24 hexadecimal digits, among others. The
  * plugin checks only that the text could be one, so a name or an email is caught at the plan.
  */
-const ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/;
+export const ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/;
 
 /**
  * `jira.assign to=<column>|me|none`: assigns each row's issue to the account id its `to=`

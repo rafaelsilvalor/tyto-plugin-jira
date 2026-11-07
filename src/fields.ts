@@ -205,7 +205,7 @@ function notA(key: string, column: string, value: unknown, what: string): JiraRe
  * priority by its `value`, `name` or `displayName`. Anything else is its JSON, so nothing is
  * dropped without a trace.
  */
-function textOf(value: unknown): string {
+export function textOf(value: unknown): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   const object = record(value);
@@ -218,7 +218,7 @@ function textOf(value: unknown): string {
 }
 
 /** An Atlassian Document Format value's text, one line per block. */
-function documentText(document: Readonly<Record<string, unknown>>): string {
+export function documentText(document: Readonly<Record<string, unknown>>): string {
   const inline = (node: unknown): string => {
     const current = record(node);
     if (current === undefined) return '';
@@ -231,6 +231,21 @@ function documentText(document: Readonly<Record<string, unknown>>): string {
     .map(inline)
     .filter((line) => line !== '')
     .join('\n');
+}
+
+/**
+ * A field's value as a cell shows it, whatever its type, for a write's drift check: the same
+ * text, number or list a pull answers, with every empty value (`null`, `''`, `[]`) as `null`,
+ * so a table's cell and what Jira holds now compare without knowing the column's type.
+ */
+export function projected(value: unknown): CellValue {
+  if (value === undefined || value === null || value === '') return null;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    return value.map((item) => (typeof item === 'number' ? item : textOf(item)));
+  }
+  if (typeof value === 'number') return value;
+  return textOf(value);
 }
 
 function configError<T>(message: string): JiraResult<T> {
