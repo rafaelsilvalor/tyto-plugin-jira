@@ -171,16 +171,18 @@ async function answerOf(
       redact(
         `Jira refused ${config.email} on ${config.baseUrl} (403): the account may not do ` +
           `${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once). ` +
-          (await quotedBody(response)),
+          quotedBody(await bodyText(response)),
       ).trim(),
       { status },
     );
   }
   if (status < 200 || status >= 300) {
+    const text = await bodyText(response);
+    const body = parsedOrUndefined(text);
     return jiraError(
       'E_JIRA_HTTP',
-      redact(`${label} answered ${statusOf(response)}. ${await quotedBody(response)}`).trim(),
-      { status },
+      redact(`${label} answered ${statusOf(response)}. ${quotedBody(text)}`).trim(),
+      { status, ...(body === undefined ? {} : { body }) },
     );
   }
 
@@ -249,14 +251,25 @@ function statusOf(response: HostFetchResponse): string {
     : `${response.status} ${response.statusText}`;
 }
 
-/** Jira's own words for a failure, shortened: `errorMessages` and `errors` when it sent JSON. */
-async function quotedBody(response: HostFetchResponse): Promise<string> {
-  let text: string;
+/** A failed answer's body as text, or `''` when it cannot be read. */
+async function bodyText(response: HostFetchResponse): Promise<string> {
   try {
-    text = (await response.text()).trim();
+    return (await response.text()).trim();
   } catch {
     return '';
   }
+}
+
+function parsedOrUndefined(text: string): unknown {
+  try {
+    return text === '' ? undefined : (JSON.parse(text) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Jira's own words for a failure, shortened: `errorMessages` and `errors` when it sent JSON. */
+function quotedBody(text: string): string {
   if (text === '') return '';
   let quoted = text;
   try {

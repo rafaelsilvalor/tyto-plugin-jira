@@ -45,6 +45,7 @@ export async function fieldCatalogue(
   client: JiraClient,
   config: JiraConfig,
   now: number,
+  verb = 'jira.set',
 ): Promise<JiraResult<readonly CatalogueField[]>> {
   const key = catalogueKey(config);
   try {
@@ -52,12 +53,12 @@ export async function fieldCatalogue(
     const age = stored === undefined ? NaN : now - Date.parse(stored.storedAt);
     const fields = stored === undefined ? undefined : entryOf(stored.bytes);
     if (stored !== undefined && fields === undefined) {
-      host.log.warn('jira.set ignored a field catalogue entry it did not write');
+      host.log.warn(`${verb} ignored a field catalogue entry it did not write`);
     } else if (fields !== undefined && age >= 0 && age < FRESH_MILLISECONDS) {
       return jiraOk(fields);
     }
   } catch (thrown) {
-    host.log.warn(`jira.set read no cached field catalogue: ${messageOf(thrown)}`);
+    host.log.warn(`${verb} read no cached field catalogue: ${messageOf(thrown)}`);
   }
 
   const answer = await client.get(FIELD_CATALOGUE);
@@ -69,7 +70,7 @@ export async function fieldCatalogue(
   try {
     await host.cache.put(key, new TextEncoder().encode(JSON.stringify({ v: 1, fields })));
   } catch (thrown) {
-    host.log.warn(`jira.set cached no field catalogue: ${messageOf(thrown)}`);
+    host.log.warn(`${verb} cached no field catalogue: ${messageOf(thrown)}`);
   }
   return jiraOk(fields);
 }

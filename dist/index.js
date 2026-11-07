@@ -135,6 +135,7 @@ var TRANSITION_VERB_ID = "jira.transition";
 var ASSIGN_VERB_ID = "jira.assign";
 var SET_VERB_ID = "jira.set";
 var COMMENT_VERB_ID = "jira.comment";
+var CREATE_VERB_ID = "jira.create";
 function verbFailed(error, verb = VERB_ID) {
   return {
     severity: "error",
@@ -142,11 +143,11 @@ function verbFailed(error, verb = VERB_ID) {
     message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
   };
 }
-function argumentsProblem(problem6, verb = VERB_ID) {
+function argumentsProblem(problem7, verb = VERB_ID) {
   return {
     severity: "error",
     code: "E_RECIPE_ARGUMENTS",
-    message: `'${verb}' ${withoutFinalStop(problem6)}.`
+    message: `'${verb}' ${withoutFinalStop(problem7)}.`
   };
 }
 function failed(diagnostic) {
@@ -376,16 +377,18 @@ async function answerOf(response, label, config, redact) {
     return jiraError(
       "E_JIRA_AUTH",
       redact(
-        `Jira refused ${config.email} on ${config.baseUrl} (403): the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once). ` + await quotedBody(response)
+        `Jira refused ${config.email} on ${config.baseUrl} (403): the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once). ` + quotedBody(await bodyText(response))
       ).trim(),
       { status }
     );
   }
   if (status < 200 || status >= 300) {
+    const text3 = await bodyText(response);
+    const body = parsedOrUndefined(text3);
     return jiraError(
       "E_JIRA_HTTP",
-      redact(`${label} answered ${statusOf(response)}. ${await quotedBody(response)}`).trim(),
-      { status }
+      redact(`${label} answered ${statusOf(response)}. ${quotedBody(text3)}`).trim(),
+      { status, ...body === void 0 ? {} : { body } }
     );
   }
   const text2 = await response.text();
@@ -436,13 +439,21 @@ function headerOf(response, name) {
 function statusOf(response) {
   return response.statusText === "" ? String(response.status) : `${response.status} ${response.statusText}`;
 }
-async function quotedBody(response) {
-  let text2;
+async function bodyText(response) {
   try {
-    text2 = (await response.text()).trim();
+    return (await response.text()).trim();
   } catch {
     return "";
   }
+}
+function parsedOrUndefined(text2) {
+  try {
+    return text2 === "" ? void 0 : JSON.parse(text2);
+  } catch {
+    return void 0;
+  }
+}
+function quotedBody(text2) {
   if (text2 === "") return "";
   let quoted = text2;
   try {
@@ -1218,29 +1229,38 @@ function shortened(text2, limit = MAX_DESCRIPTION_LENGTH) {
 var systemClock = { now: () => Date.now() };
 var APPLY_BUDGET_MILLISECONDS = 2e4;
 var NOT_REACHED = "not reached in this call's time; run the cell and Apply again";
-var DRIFT_FIELDS = ["status", "assignee", "updated"];
-async function applyBatch(host, request, verb, clock = systemClock) {
-  const { operations } = request;
+async function openSession(host, request, clock = systemClock) {
   const config = await resolveJiraConfig(host, request.section);
-  if (!config.ok) return answered(operations.map(() => failedWith(config.error)));
-  const redact = (text2) => config.value.token === "" ? text2 : text2.split(config.value.token).join("[redacted]");
-  const finished = (outcome) => outcome.reason === void 0 ? outcome : { ...outcome, reason: shortened(redact(outcome.reason)) };
+  if (!config.ok) return config;
+  const { token } = config.value;
+  const redact = (text2) => token === "" ? text2 : text2.split(token).join("[redacted]");
   const deadline = clock.now() + APPLY_BUDGET_MILLISECONDS;
   let outOfTime = false;
+  const expired = () => {
+    if (clock.now() > deadline) outOfTime = true;
+    return outOfTime;
+  };
   const client = createJiraClient({
     config: config.value,
-    fetch: (url, init) => {
-      if (outOfTime || clock.now() > deadline) {
-        outOfTime = true;
-        return Promise.reject(new Error(NOT_REACHED));
-      }
-      return host.fetch(url, init);
-    },
+    fetch: (url, init) => expired() ? Promise.reject(new Error(NOT_REACHED)) : host.fetch(url, init),
     sleep: async (milliseconds) => {
       if (clock.now() + milliseconds > deadline) outOfTime = true;
       else await (clock.sleep ?? wait)(milliseconds);
     }
   });
+  return jiraOk({
+    config: config.value,
+    client,
+    expired,
+    finished: (outcome) => outcome.reason === void 0 ? outcome : { ...outcome, reason: shortened(redact(outcome.reason)) }
+  });
+}
+var DRIFT_FIELDS = ["status", "assignee", "updated"];
+async function applyBatch(host, request, verb, clock = systemClock) {
+  const { operations } = request;
+  const session = await openSession(host, request, clock);
+  if (!session.ok) return answered(operations.map(() => failedWith(session.error)));
+  const { client, config, finished, expired } = session.value;
   const decoded = operations.map((operation) => decodeOperation(operation.payload, verb));
   const keys = [
     ...new Set(
@@ -1249,7 +1269,7 @@ async function applyBatch(host, request, verb, clock = systemClock) {
   ];
   const extra = verb.fields?.(decoded.filter((each) => typeof each === "object")) ?? [];
   const read = keys.length === 0 ? jiraOk(/* @__PURE__ */ new Map()) : await currentIssues(client, keys, extra);
-  const context = read.ok ? { client, config: config.value, current: read.value } : void 0;
+  const context = read.ok ? { client, config, current: read.value } : void 0;
   let refused2;
   const outcomes = [];
   for (const each of decoded) {
@@ -1261,8 +1281,7 @@ async function applyBatch(host, request, verb, clock = systemClock) {
       outcomes.push(finished(failedWith(read.error)));
       continue;
     }
-    if (outOfTime || clock.now() > deadline) {
-      outOfTime = true;
+    if (expired()) {
       outcomes.push({ status: "skipped", reason: NOT_REACHED });
       continue;
     }
@@ -1636,285 +1655,24 @@ function problem2(text2) {
   return argumentsProblem(text2, COMMENT_VERB_ID);
 }
 
-// src/refresh.ts
-var MAX_KEYS = 1e3;
-var MAX_CHILDREN = 5e3;
-var BUDGET_MILLISECONDS = 25e3;
-var PARENTS_PER_SEARCH = 100;
-var ARGUMENTS4 = [
-  { name: "by", type: "text" },
-  { name: "only", type: "text" },
-  { name: "children", type: "boolean" }
-];
-var systemClock2 = { now: () => Date.now() };
-function refreshVerb(host, clock = systemClock2) {
-  return {
-    id: REFRESH_VERB_ID,
-    kind: "transform",
-    arguments: ARGUMENTS4,
-    transform: (request) => refreshTable(host, request, clock)
-  };
-}
-async function refreshTable(host, request, clock = systemClock2) {
-  const { table } = request;
-  const asked = readArguments(request);
-  if ("severity" in asked) return refused(asked);
-  const { by, only, children } = asked;
-  const mapped = mappedFields(request.section);
-  if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
-  const jiraNames = /* @__PURE__ */ new Set([
-    ...FIXED_COLUMNS.map((column) => column.name),
-    ...mapped.value.map(({ column }) => column)
-  ]);
-  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
-    return refused(
-      problem3(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
-    );
-  }
-  const keyOf = (row) => {
-    const value = by === void 0 ? row.key : row.values[by.name];
-    const key = typeof value === "string" ? value.trim() : void 0;
-    return key !== void 0 && ISSUE_KEY.test(key) ? key : void 0;
-  };
-  const keys = [
-    ...new Set(
-      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
-    )
-  ];
-  if (keys.length > MAX_KEYS) {
-    return refused(
-      narrow(
-        `would refresh ${issueCount(keys.length)}, more than the ${count(MAX_KEYS)} one call takes`
-      )
-    );
-  }
-  const config = await resolveJiraConfig(host, request.section);
-  if (!config.ok) return refused(verbFailed(config.error, REFRESH_VERB_ID));
-  const deadline = clock.now() + BUDGET_MILLISECONDS;
-  let overBudget = false;
-  const client = createJiraClient({
-    config: config.value,
-    fetch: (url, init) => {
-      if (clock.now() > deadline) {
-        overBudget = true;
-        return Promise.reject(new Error("the refresh ran out of time"));
-      }
-      return host.fetch(url, init);
-    },
-    sleep: async (milliseconds) => {
-      if (clock.now() + milliseconds > deadline) overBudget = true;
-      else await (clock.sleep ?? wait2)(milliseconds);
-    }
-  });
-  const jiraFailed = (error) => overBudget ? refused(
-    narrow(
-      `did not finish ${issueCount(keys.length)} within ${BUDGET_MILLISECONDS / 1e3} s`
-    )
-  ) : refused(verbFailed(error, REFRESH_VERB_ID));
-  const types = await mappedTypes(client, mapped.value);
-  if (!types.ok) return jiraFailed(types.error);
-  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
-  const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
-  for (const target of targets) {
-    const column = existing.get(target.name);
-    if (column !== void 0 && column.type !== target.type) {
-      return refused(
-        problem3(
-          `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
-        )
-      );
-    }
-  }
-  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
-  const found = await fetchIssues(client, keys, fields);
-  if (!found.ok) return jiraFailed(found.error);
-  const issues = /* @__PURE__ */ new Map();
-  for (const issue of found.value.values()) issues.set(issue.key, issue);
-  if (children) {
-    const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
-    const read2 = await childrenOf(client, parents, fields);
-    if (!read2.ok) return jiraFailed(read2.error);
-    if (read2.value === "too many") {
-      return refused(
-        narrow(`found more than ${count(MAX_CHILDREN)} children of ${issueCount(parents.length)}`)
-      );
-    }
-    for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
-  }
-  const ordered = [...issues.values()];
-  const read = await readIssues(client, ordered);
-  if (!read.ok) return jiraFailed(read.error);
-  const fetchedAt = new Date(clock.now()).toISOString();
-  const nameOf = (name) => existing.get(name)?.name ?? name;
-  const live = /* @__PURE__ */ new Map();
-  for (const [index, issue] of ordered.entries()) {
-    const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
-      baseUrl: config.value.baseUrl,
-      fetchedAt,
-      mapped: mapped.value,
-      types: types.value
-    });
-    if (!row.ok) return jiraFailed(row.error);
-    const values = {};
-    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
-    live.set(issue.key, {
-      key: issue.key,
-      values,
-      provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
-    });
-  }
-  const added = targets.filter((target) => !existing.has(target.name));
-  const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
-  const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
-  const askedKeys = new Set(keys);
-  const rowKeys = new Set(table.rows.map((row) => row.key));
-  const present = /* @__PURE__ */ new Set();
-  const rows = table.rows.map((row) => {
-    const key = keyOf(row);
-    if (key === void 0) return { ...row, values: { ...addedNulls, ...row.values } };
-    const issue = found.value.get(key) ?? issues.get(key);
-    const fresh = issue === void 0 ? void 0 : live.get(issue.key);
-    if (fresh !== void 0) {
-      present.add(fresh.key);
-      return { ...row, values: { ...row.values, ...fresh.values }, provenance: fresh.provenance };
-    }
-    if (!askedKeys.has(key)) return { ...row, values: { ...addedNulls, ...row.values } };
-    const values = { ...row.values, ...jiraNulls };
-    if (by !== void 0) values[by.name] = row.values[by.name] ?? null;
-    return { ...row, values };
-  });
-  const emptyRow = Object.fromEntries(
-    [...table.columns.map((column) => column.name), ...added.map((column) => column.name)].map(
-      (name) => [name, null]
-    )
-  );
-  for (const [key, fresh] of live) {
-    if (present.has(key)) continue;
-    if (rowKeys.has(key)) {
-      return refused(
-        problem3(
-          `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
-        )
-      );
-    }
-    const values = { ...emptyRow, ...fresh.values };
-    if (by !== void 0) values[by.name] = key;
-    rows.push({ ...fresh, values });
-  }
-  return { ok: true, value: { columns: [...table.columns, ...added], rows }, diagnostics: [] };
-}
-function readArguments(request) {
-  const columns = new Map(
-    request.table.columns.map((column) => [column.name.toLowerCase(), column])
-  );
-  const columnOf = (name) => {
-    const written = request.arguments[name];
-    if (written === void 0) return void 0;
-    const column = columns.get(String(written).trim().toLowerCase());
-    return column ?? problem3(`${name}= names '${String(written)}', which is not a column of the table`);
-  };
-  const by = columnOf("by");
-  if (by !== void 0 && "severity" in by) return by;
-  if (by !== void 0 && by.type !== "text") {
-    return problem3(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
-  }
-  const only = columnOf("only");
-  if (only !== void 0 && "severity" in only) return only;
-  if (only !== void 0 && only.type !== "boolean") {
-    return problem3(
-      `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
-    );
-  }
-  return { by, only, children: request.arguments["children"] === true };
-}
-async function fetchIssues(client, keys, fields) {
-  const answered2 = await bulkIssues(client, keys, fields);
-  if (!answered2.ok) return answered2;
-  const byKey = new Map(answered2.value.issues.map((issue) => [issue.key, issue]));
-  const found = /* @__PURE__ */ new Map();
-  for (const key of keys) {
-    const issue = byKey.get(key);
-    if (issue !== void 0) {
-      found.set(key, issue);
-      continue;
-    }
-    if (answered2.value.refused.has(key)) continue;
-    const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
-    const single = await client.get(path, { fields: fields.join(",") });
-    if (!single.ok) {
-      if (single.error.status === 404) continue;
-      return single;
-    }
-    const moved = issueOf(single.value);
-    if (moved === void 0) {
-      return jiraError(
-        "E_JIRA_RESPONSE",
-        `GET ${path} answered an issue without an id, a key or fields.`
-      );
-    }
-    found.set(key, moved);
-  }
-  return jiraOk(found);
-}
-async function childrenOf(client, parents, fields) {
-  const children = [];
-  for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
-    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
-    let token;
-    for (; ; ) {
-      const page = await searchPage(client, jql, fields, token);
-      if (!page.ok) return page;
-      children.push(...page.value.issues);
-      if (children.length > MAX_CHILDREN) return jiraOk("too many");
-      const next = page.value.nextPageToken;
-      if (page.value.isLast || next === void 0) break;
-      if (next === token) {
-        return jiraError("E_JIRA_RESPONSE", "the children search answered the token it was given.");
-      }
-      token = next;
-    }
-  }
-  return jiraOk(children);
-}
-function problem3(text2) {
-  return argumentsProblem(text2, REFRESH_VERB_ID);
-}
-function narrow(what) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_VERB",
-    message: `'${REFRESH_VERB_ID}' ${what}; narrow it with only=.`
-  };
-}
-function refused(diagnostic) {
-  return { ok: false, error: [diagnostic] };
-}
-function issueCount(value) {
-  return `${count(value)} ${value === 1 ? "issue" : "issues"}`;
-}
-function count(value) {
-  return value.toLocaleString("en-US");
-}
-var wait2 = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-
 // src/write/catalogue.ts
 var FIELD_CATALOGUE2 = "/rest/api/3/field";
 function catalogueKey(config) {
   return `jira/field/v1/${new URL(config.baseUrl).host}/${fingerprint(config.email)}`;
 }
-async function fieldCatalogue(host, client, config, now) {
+async function fieldCatalogue(host, client, config, now, verb = "jira.set") {
   const key = catalogueKey(config);
   try {
     const stored = await host.cache.get(key);
     const age = stored === void 0 ? NaN : now - Date.parse(stored.storedAt);
     const fields2 = stored === void 0 ? void 0 : entryOf2(stored.bytes);
     if (stored !== void 0 && fields2 === void 0) {
-      host.log.warn("jira.set ignored a field catalogue entry it did not write");
+      host.log.warn(`${verb} ignored a field catalogue entry it did not write`);
     } else if (fields2 !== void 0 && age >= 0 && age < FRESH_MILLISECONDS) {
       return jiraOk(fields2);
     }
   } catch (thrown) {
-    host.log.warn(`jira.set read no cached field catalogue: ${messageOf(thrown)}`);
+    host.log.warn(`${verb} read no cached field catalogue: ${messageOf(thrown)}`);
   }
   const answer = await client.get(FIELD_CATALOGUE2);
   if (!answer.ok) return answer;
@@ -1925,7 +1683,7 @@ async function fieldCatalogue(host, client, config, now) {
   try {
     await host.cache.put(key, new TextEncoder().encode(JSON.stringify({ v: 1, fields })));
   } catch (thrown) {
-    host.log.warn(`jira.set cached no field catalogue: ${messageOf(thrown)}`);
+    host.log.warn(`${verb} cached no field catalogue: ${messageOf(thrown)}`);
   }
   return jiraOk(fields);
 }
@@ -1958,7 +1716,7 @@ function entryOf2(bytes) {
 
 // src/set.ts
 var SET_WRITE = "field";
-var ARGUMENTS5 = [
+var ARGUMENTS4 = [
   { name: "field", type: "text", required: true },
   { name: "value", type: "text", required: true }
 ];
@@ -1974,7 +1732,7 @@ function setVerb(host, clock = systemClock) {
   return {
     id: SET_VERB_ID,
     kind: "action",
-    arguments: ARGUMENTS5,
+    arguments: ARGUMENTS4,
     writes: [SET_WRITE],
     plan: (request) => planSets(host, request, clock),
     apply: (request) => applySets(host, request, clock)
@@ -1986,7 +1744,7 @@ async function planSets(host, request, clock = systemClock) {
   const valueName = String(request.arguments["value"] ?? "").trim();
   const valueColumn = columnNamed(table, valueName);
   if (valueColumn === void 0) {
-    return planRefused(problem4(`value= names '${valueName}', which is not a column of the table`));
+    return planRefused(problem3(`value= names '${valueName}', which is not a column of the table`));
   }
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return planRefused(verbFailed(config.error, SET_VERB_ID));
@@ -2003,7 +1761,7 @@ async function planSets(host, request, clock = systemClock) {
     const found = catalogue.value.find((each) => each.id === mapping.id);
     if (found === void 0) {
       return planRefused(
-        problem4(`field= names ${name}, mapped to ${mapping.id}, and this site has no such field`)
+        problem3(`field= names ${name}, mapped to ${mapping.id}, and this site has no such field`)
       );
     }
     schema = found.schema;
@@ -2011,7 +1769,7 @@ async function planSets(host, request, clock = systemClock) {
   }
   if (schema === void 0) {
     return planRefused(
-      problem4(
+      problem3(
         `field= names '${field}', which is neither a column the fields of the jira section map nor summary, labels, duedate or priority`
       )
     );
@@ -2020,7 +1778,7 @@ async function planSets(host, request, clock = systemClock) {
   if (kind === void 0) {
     const type = schema.items === void 0 ? schema.type : `${schema.type} of ${schema.items}`;
     return planRefused(
-      problem4(`field= names ${name}, a field of type ${type ?? "unknown"}, which it cannot write`)
+      problem3(`field= names ${name}, a field of type ${type ?? "unknown"}, which it cannot write`)
     );
   }
   const target = { id, name, kind };
@@ -2181,9 +1939,584 @@ function holds(current, wanted) {
   }
   return false;
 }
-function problem4(text2) {
+function problem3(text2) {
   return argumentsProblem(text2, SET_VERB_ID);
 }
+
+// src/create.ts
+var CREATE_WRITE = "create";
+var BULK_CREATE_SIZE = 50;
+var MAX_SUMMARY_LENGTH = 255;
+var MAX_DESCRIPTION_BYTES = 1500;
+var BULK_CREATE = "/rest/api/3/issue/bulk";
+var PROJECT_KEY = /^[A-Z][A-Z0-9_]+$/;
+var ARGUMENTS5 = [
+  { name: "project", type: "text", required: true },
+  { name: "type", type: "text", required: true },
+  { name: "summary", type: "text", required: true },
+  { name: "description", type: "text", required: false },
+  { name: "parent", type: "text", required: false }
+];
+function createVerb(host, clock = systemClock) {
+  return {
+    id: CREATE_VERB_ID,
+    kind: "action",
+    arguments: ARGUMENTS5,
+    writes: [CREATE_WRITE],
+    plan: (request) => planCreates(host, request, clock),
+    apply: (request) => applyCreates(host, request, clock)
+  };
+}
+function creationLabel(site, project, rowKey) {
+  return `tyto-${fingerprint(JSON.stringify([site, project, rowKey]))}`;
+}
+async function planCreates(host, request, clock = systemClock) {
+  const { table } = request;
+  const project = String(request.arguments["project"] ?? "").trim();
+  const type = String(request.arguments["type"] ?? "").trim();
+  if (!PROJECT_KEY.test(project)) {
+    return planRefused(problem4(`project= is '${project}', which is not a project key, such as EX`));
+  }
+  if (type === "") return planRefused(problem4("type= names no issue type, such as Task"));
+  const columns = {};
+  for (const name of ["summary", "description", "parent"]) {
+    const written = request.arguments[name];
+    if (written === void 0 || written === null) continue;
+    const column = columnNamed(table, String(written).trim());
+    if (column === void 0) {
+      return planRefused(
+        problem4(`${name}= names '${String(written)}', which is not a column of the table`)
+      );
+    }
+    columns[name] = column.name;
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return planRefused(verbFailed(config.error, CREATE_VERB_ID));
+  const named2 = Object.values(columns);
+  const targets = await mappedTargets(host, config.value, request.section, table, named2, clock);
+  if (!targets.ok) return planRefused(targets.error);
+  const site = new URL(config.value.baseUrl).hostname;
+  const operations = [];
+  for (const row of table.rows) {
+    const summary = cellText(columns.summary === void 0 ? null : row.values[columns.summary]);
+    const preview = shortened(summary.replace(/\s+/g, " "), 80);
+    const described = `${project}: create ${type} "${preview}"`;
+    const fail = (reason) => {
+      operations.push(plannedFailure(CREATE_WRITE, row.key, described, reason));
+    };
+    const why = `E_JIRA_PLAN: row ${row.key}`;
+    if (summary === "") {
+      fail(`${why} has no text in ${columns.summary ?? "the summary column"}`);
+      continue;
+    }
+    if (summary.length > MAX_SUMMARY_LENGTH) {
+      fail(
+        `${why}'s summary is ${summary.length} characters, over the ${MAX_SUMMARY_LENGTH} Jira takes`
+      );
+      continue;
+    }
+    const description = cellText(
+      columns.description === void 0 ? null : row.values[columns.description]
+    );
+    const bytes = new TextEncoder().encode(description).byteLength;
+    if (bytes > MAX_DESCRIPTION_BYTES) {
+      fail(
+        `${why}'s description is ${bytes.toLocaleString("en-US")} bytes, over the ${MAX_DESCRIPTION_BYTES.toLocaleString("en-US")} a plan carries; shorten it`
+      );
+      continue;
+    }
+    const parent = cellText(columns.parent === void 0 ? null : row.values[columns.parent]);
+    if (parent !== "" && !ISSUE_KEY.test(parent)) {
+      fail(`${why}'s parent ${JSON.stringify(parent.slice(0, 80))} is not an issue key`);
+      continue;
+    }
+    const mapped = {};
+    let refused2;
+    for (const target of targets.value) {
+      const cell = row.values[target.column] ?? null;
+      if (projected(cell) === null) continue;
+      const value = converted(target, cell);
+      if (typeof value === "string") {
+        refused2 = `${why}: ${value}`;
+        break;
+      }
+      mapped[target.id] = value.v;
+    }
+    if (refused2 !== void 0) {
+      fail(refused2);
+      continue;
+    }
+    operations.push(
+      plannedOperation(
+        CREATE_WRITE,
+        row.key,
+        parent === "" ? described : `${described} under ${parent}`,
+        {
+          p: project,
+          t: type,
+          s: summary,
+          ...description === "" ? {} : { d: description },
+          ...parent === "" ? {} : { par: parent },
+          m: mapped,
+          tok: creationLabel(site, project, row.key)
+        }
+      )
+    );
+  }
+  return planOf(`Jira ${site}`, operations);
+}
+async function mappedTargets(host, config, section, table, named2, clock) {
+  const mapped = mappedFields(section);
+  if (!mapped.ok) return failure(verbFailed(mapped.error, CREATE_VERB_ID));
+  const present = mapped.value.flatMap((each) => {
+    const column = columnNamed(table, each.column);
+    return column === void 0 || named2.includes(column.name) ? [] : [{ ...each, column: column.name }];
+  });
+  if (present.length === 0) return { ok: true, value: [] };
+  const client = createJiraClient({ config, fetch: host.fetch });
+  const catalogue = await fieldCatalogue(host, client, config, clock.now(), CREATE_VERB_ID);
+  if (!catalogue.ok) return failure(verbFailed(catalogue.error, CREATE_VERB_ID));
+  const targets = [];
+  for (const { column, id } of present) {
+    const found = catalogue.value.find((each) => each.id === id);
+    if (found === void 0) {
+      return failure(
+        problem4(`writes the column ${column}, mapped to ${id}, and this site has no such field`)
+      );
+    }
+    const kind = kindOf(found.schema);
+    if (kind === void 0) {
+      const { type, items } = found.schema;
+      return failure(
+        problem4(
+          `writes the column ${column}, a field of type ${items === void 0 ? type ?? "unknown" : `${type} of ${items}`}, which it cannot write; drop the column before the step`
+        )
+      );
+    }
+    targets.push({ column, id, name: column, kind });
+  }
+  return { ok: true, value: targets };
+}
+function failure(diagnostic) {
+  return { ok: false, error: diagnostic };
+}
+function cellText(cell) {
+  if (cell === void 0 || cell === null) return "";
+  return (Array.isArray(cell) ? cell.map(String).join(", ") : textOf(cell)).trim();
+}
+async function applyCreates(host, request, clock = systemClock) {
+  const { operations } = request;
+  const session = await openSession(host, request, clock);
+  if (!session.ok) return answered(operations.map(() => failedWith(session.error)));
+  const { client, finished, expired } = session.value;
+  const outcomes = new Array(operations.length);
+  const pending = [];
+  operations.forEach((operation, index) => {
+    const planned = decode4(operation.payload);
+    if (typeof planned === "string") outcomes[index] = { status: "failed", reason: planned };
+    else pending.push({ index, planned });
+  });
+  const created = await createdBefore(
+    client,
+    pending.map(({ planned }) => planned.tok)
+  );
+  const remaining = pending.filter(({ index, planned }) => {
+    if (!created.ok) outcomes[index] = failedWith(created.error);
+    const key = created.ok ? created.value.get(planned.tok) : void 0;
+    if (key !== void 0) {
+      outcomes[index] = { status: "applied", reason: `already created ${key}; nothing written` };
+    }
+    return outcomes[index] === void 0;
+  });
+  let refused2;
+  for (let start = 0; start < remaining.length; start += BULK_CREATE_SIZE) {
+    const chunk = remaining.slice(start, start + BULK_CREATE_SIZE);
+    if (refused2 === void 0 && !expired()) {
+      const answers = await bulkCreate(
+        client,
+        chunk.map(({ planned }) => planned)
+      );
+      chunk.forEach(({ index }, position) => {
+        const answer = answers[position] ?? { status: "failed", reason: UNMATCHED };
+        outcomes[index] = answer.status === "failed" && answer.reason?.includes(NOT_REACHED) === true ? { status: "skipped", reason: NOT_REACHED } : answer;
+        if (answer.reason?.startsWith("E_JIRA_AUTH") === true) refused2 = answer.reason;
+      });
+      continue;
+    }
+    for (const { index } of chunk) {
+      outcomes[index] = refused2 === void 0 ? { status: "skipped", reason: NOT_REACHED } : { status: "failed", reason: refused2 };
+    }
+  }
+  return answered(outcomes.map(finished));
+}
+function decode4(payload) {
+  const object = record(payload);
+  const planned = object?.["x"];
+  if (typeof planned === "string") return planned;
+  const { p, t, s, d, par, m, tok } = object ?? {};
+  const fields = record(m);
+  if (typeof p !== "string" || typeof t !== "string" || typeof s !== "string" || typeof tok !== "string" || fields === void 0 || d !== void 0 && typeof d !== "string" || par !== void 0 && typeof par !== "string") {
+    return "E_JIRA_PLAN: this operation carries no payload this version of the plugin reads; run the cell again";
+  }
+  return {
+    p,
+    t,
+    s,
+    ...d === void 0 ? {} : { d },
+    ...par === void 0 ? {} : { par },
+    m: fields,
+    tok
+  };
+}
+async function createdBefore(client, labels) {
+  const found = /* @__PURE__ */ new Map();
+  if (labels.length === 0) return jiraOk(found);
+  const wanted = new Set(labels);
+  const jql = `labels in (${labels.map((label) => `"${label}"`).join(", ")}) ORDER BY key ASC`;
+  let token;
+  for (; ; ) {
+    const page = await searchPage(client, jql, ["labels"], token);
+    if (!page.ok) return page;
+    for (const issue of page.value.issues) {
+      const carried = issue.fields["labels"];
+      for (const label of Array.isArray(carried) ? carried : []) {
+        if (typeof label === "string" && wanted.has(label) && !found.has(label)) {
+          found.set(label, issue.key);
+        }
+      }
+    }
+    const next = page.value.nextPageToken;
+    if (page.value.isLast || next === void 0) return jiraOk(found);
+    if (next === token) {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        "the search for the labels answered the token it was given."
+      );
+    }
+    token = next;
+  }
+}
+var UNMATCHED = "E_JIRA_RESPONSE: the bulk create answered what cannot be matched to its rows; run the cell and Apply again, which finds what was created by its label";
+async function bulkCreate(client, planned) {
+  const answer = await client.post(BULK_CREATE, {
+    issueUpdates: planned.map((each) => ({ fields: fieldsOf(each) }))
+  });
+  let body;
+  if (answer.ok) body = record(answer.value);
+  else if (answer.error.status === 400) body = record(answer.error.body);
+  if (!answer.ok && !Array.isArray(body?.["errors"])) {
+    return planned.map(() => failedWith(answer.error));
+  }
+  const issues = Array.isArray(body?.["issues"]) ? body["issues"] : [];
+  const errors = Array.isArray(body?.["errors"]) ? body["errors"] : [];
+  const refusals = /* @__PURE__ */ new Map();
+  for (const each of errors) {
+    const error = record(each);
+    const element = error?.["failedElementNumber"];
+    if (typeof element !== "number" || !Number.isInteger(element)) continue;
+    if (element < 0 || element >= planned.length) continue;
+    const status = typeof error?.["status"] === "number" ? ` (${error["status"]})` : "";
+    refusals.set(
+      element,
+      `E_JIRA_HTTP: Jira refused to create it${status}: ${elementMessage(error?.["elementErrors"])}`
+    );
+  }
+  const accepted = planned.flatMap((_, index) => refusals.has(index) ? [] : [index]);
+  const keys = issues.map((issue) => record(issue)?.["key"]);
+  const matched = keys.length === accepted.length && keys.every((key) => typeof key === "string" && key !== "");
+  return planned.map((_, index) => {
+    const refusal = refusals.get(index);
+    if (refusal !== void 0) return { status: "failed", reason: refusal };
+    if (!matched) return { status: "failed", reason: UNMATCHED };
+    return { status: "applied", reason: `created ${String(keys[accepted.indexOf(index)])}` };
+  });
+}
+function fieldsOf(planned) {
+  const labels = planned.m["labels"];
+  return {
+    ...planned.m,
+    project: { key: planned.p },
+    issuetype: { name: planned.t },
+    summary: planned.s,
+    ...planned.d === void 0 ? {} : { description: textToAdf(planned.d) },
+    ...planned.par === void 0 ? {} : { parent: { key: planned.par } },
+    labels: [...Array.isArray(labels) ? labels : [], planned.tok]
+  };
+}
+function elementMessage(value) {
+  const errors = record(value);
+  const messages = [
+    ...Array.isArray(errors?.["errorMessages"]) ? errors["errorMessages"].map(String) : [],
+    ...Object.entries(record(errors?.["errors"]) ?? {}).map(
+      ([field, message]) => `${field}: ${String(message)}`
+    )
+  ];
+  return messages.length === 0 ? "Jira gave no reason" : messages.join("; ");
+}
+function problem4(text2) {
+  return argumentsProblem(text2, CREATE_VERB_ID);
+}
+
+// src/refresh.ts
+var MAX_KEYS = 1e3;
+var MAX_CHILDREN = 5e3;
+var BUDGET_MILLISECONDS = 25e3;
+var PARENTS_PER_SEARCH = 100;
+var ARGUMENTS6 = [
+  { name: "by", type: "text" },
+  { name: "only", type: "text" },
+  { name: "children", type: "boolean" }
+];
+var systemClock2 = { now: () => Date.now() };
+function refreshVerb(host, clock = systemClock2) {
+  return {
+    id: REFRESH_VERB_ID,
+    kind: "transform",
+    arguments: ARGUMENTS6,
+    transform: (request) => refreshTable(host, request, clock)
+  };
+}
+async function refreshTable(host, request, clock = systemClock2) {
+  const { table } = request;
+  const asked = readArguments(request);
+  if ("severity" in asked) return refused(asked);
+  const { by, only, children } = asked;
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
+  const jiraNames = /* @__PURE__ */ new Set([
+    ...FIXED_COLUMNS.map((column) => column.name),
+    ...mapped.value.map(({ column }) => column)
+  ]);
+  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
+    return refused(
+      problem5(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
+    );
+  }
+  const keyOf = (row) => {
+    const value = by === void 0 ? row.key : row.values[by.name];
+    const key = typeof value === "string" ? value.trim() : void 0;
+    return key !== void 0 && ISSUE_KEY.test(key) ? key : void 0;
+  };
+  const keys = [
+    ...new Set(
+      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
+    )
+  ];
+  if (keys.length > MAX_KEYS) {
+    return refused(
+      narrow(
+        `would refresh ${issueCount(keys.length)}, more than the ${count(MAX_KEYS)} one call takes`
+      )
+    );
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return refused(verbFailed(config.error, REFRESH_VERB_ID));
+  const deadline = clock.now() + BUDGET_MILLISECONDS;
+  let overBudget = false;
+  const client = createJiraClient({
+    config: config.value,
+    fetch: (url, init) => {
+      if (clock.now() > deadline) {
+        overBudget = true;
+        return Promise.reject(new Error("the refresh ran out of time"));
+      }
+      return host.fetch(url, init);
+    },
+    sleep: async (milliseconds) => {
+      if (clock.now() + milliseconds > deadline) overBudget = true;
+      else await (clock.sleep ?? wait2)(milliseconds);
+    }
+  });
+  const jiraFailed = (error) => overBudget ? refused(
+    narrow(
+      `did not finish ${issueCount(keys.length)} within ${BUDGET_MILLISECONDS / 1e3} s`
+    )
+  ) : refused(verbFailed(error, REFRESH_VERB_ID));
+  const types = await mappedTypes(client, mapped.value);
+  if (!types.ok) return jiraFailed(types.error);
+  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
+  const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
+  for (const target of targets) {
+    const column = existing.get(target.name);
+    if (column !== void 0 && column.type !== target.type) {
+      return refused(
+        problem5(
+          `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
+        )
+      );
+    }
+  }
+  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
+  const found = await fetchIssues(client, keys, fields);
+  if (!found.ok) return jiraFailed(found.error);
+  const issues = /* @__PURE__ */ new Map();
+  for (const issue of found.value.values()) issues.set(issue.key, issue);
+  if (children) {
+    const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
+    const read2 = await childrenOf(client, parents, fields);
+    if (!read2.ok) return jiraFailed(read2.error);
+    if (read2.value === "too many") {
+      return refused(
+        narrow(`found more than ${count(MAX_CHILDREN)} children of ${issueCount(parents.length)}`)
+      );
+    }
+    for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
+  }
+  const ordered = [...issues.values()];
+  const read = await readIssues(client, ordered);
+  if (!read.ok) return jiraFailed(read.error);
+  const fetchedAt = new Date(clock.now()).toISOString();
+  const nameOf = (name) => existing.get(name)?.name ?? name;
+  const live = /* @__PURE__ */ new Map();
+  for (const [index, issue] of ordered.entries()) {
+    const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
+      baseUrl: config.value.baseUrl,
+      fetchedAt,
+      mapped: mapped.value,
+      types: types.value
+    });
+    if (!row.ok) return jiraFailed(row.error);
+    const values = {};
+    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
+    live.set(issue.key, {
+      key: issue.key,
+      values,
+      provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
+    });
+  }
+  const added = targets.filter((target) => !existing.has(target.name));
+  const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
+  const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
+  const askedKeys = new Set(keys);
+  const rowKeys = new Set(table.rows.map((row) => row.key));
+  const present = /* @__PURE__ */ new Set();
+  const rows = table.rows.map((row) => {
+    const key = keyOf(row);
+    if (key === void 0) return { ...row, values: { ...addedNulls, ...row.values } };
+    const issue = found.value.get(key) ?? issues.get(key);
+    const fresh = issue === void 0 ? void 0 : live.get(issue.key);
+    if (fresh !== void 0) {
+      present.add(fresh.key);
+      return { ...row, values: { ...row.values, ...fresh.values }, provenance: fresh.provenance };
+    }
+    if (!askedKeys.has(key)) return { ...row, values: { ...addedNulls, ...row.values } };
+    const values = { ...row.values, ...jiraNulls };
+    if (by !== void 0) values[by.name] = row.values[by.name] ?? null;
+    return { ...row, values };
+  });
+  const emptyRow = Object.fromEntries(
+    [...table.columns.map((column) => column.name), ...added.map((column) => column.name)].map(
+      (name) => [name, null]
+    )
+  );
+  for (const [key, fresh] of live) {
+    if (present.has(key)) continue;
+    if (rowKeys.has(key)) {
+      return refused(
+        problem5(
+          `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
+        )
+      );
+    }
+    const values = { ...emptyRow, ...fresh.values };
+    if (by !== void 0) values[by.name] = key;
+    rows.push({ ...fresh, values });
+  }
+  return { ok: true, value: { columns: [...table.columns, ...added], rows }, diagnostics: [] };
+}
+function readArguments(request) {
+  const columns = new Map(
+    request.table.columns.map((column) => [column.name.toLowerCase(), column])
+  );
+  const columnOf = (name) => {
+    const written = request.arguments[name];
+    if (written === void 0) return void 0;
+    const column = columns.get(String(written).trim().toLowerCase());
+    return column ?? problem5(`${name}= names '${String(written)}', which is not a column of the table`);
+  };
+  const by = columnOf("by");
+  if (by !== void 0 && "severity" in by) return by;
+  if (by !== void 0 && by.type !== "text") {
+    return problem5(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
+  }
+  const only = columnOf("only");
+  if (only !== void 0 && "severity" in only) return only;
+  if (only !== void 0 && only.type !== "boolean") {
+    return problem5(
+      `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
+    );
+  }
+  return { by, only, children: request.arguments["children"] === true };
+}
+async function fetchIssues(client, keys, fields) {
+  const answered2 = await bulkIssues(client, keys, fields);
+  if (!answered2.ok) return answered2;
+  const byKey = new Map(answered2.value.issues.map((issue) => [issue.key, issue]));
+  const found = /* @__PURE__ */ new Map();
+  for (const key of keys) {
+    const issue = byKey.get(key);
+    if (issue !== void 0) {
+      found.set(key, issue);
+      continue;
+    }
+    if (answered2.value.refused.has(key)) continue;
+    const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const single = await client.get(path, { fields: fields.join(",") });
+    if (!single.ok) {
+      if (single.error.status === 404) continue;
+      return single;
+    }
+    const moved = issueOf(single.value);
+    if (moved === void 0) {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        `GET ${path} answered an issue without an id, a key or fields.`
+      );
+    }
+    found.set(key, moved);
+  }
+  return jiraOk(found);
+}
+async function childrenOf(client, parents, fields) {
+  const children = [];
+  for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
+    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
+    let token;
+    for (; ; ) {
+      const page = await searchPage(client, jql, fields, token);
+      if (!page.ok) return page;
+      children.push(...page.value.issues);
+      if (children.length > MAX_CHILDREN) return jiraOk("too many");
+      const next = page.value.nextPageToken;
+      if (page.value.isLast || next === void 0) break;
+      if (next === token) {
+        return jiraError("E_JIRA_RESPONSE", "the children search answered the token it was given.");
+      }
+      token = next;
+    }
+  }
+  return jiraOk(children);
+}
+function problem5(text2) {
+  return argumentsProblem(text2, REFRESH_VERB_ID);
+}
+function narrow(what) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_VERB",
+    message: `'${REFRESH_VERB_ID}' ${what}; narrow it with only=.`
+  };
+}
+function refused(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function issueCount(value) {
+  return `${count(value)} ${value === 1 ? "issue" : "issues"}`;
+}
+function count(value) {
+  return value.toLocaleString("en-US");
+}
+var wait2 = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 // src/settings.ts
 var SETTINGS = [
@@ -2273,7 +2606,7 @@ function configError2(message) {
 
 // src/transition.ts
 var TRANSITION_WRITE = "transition";
-var ARGUMENTS6 = [
+var ARGUMENTS7 = [
   { name: "to", type: "text", required: true },
   { name: "workflow", type: "text" }
 ];
@@ -2282,7 +2615,7 @@ function transitionVerb(host, clock = systemClock) {
   return {
     id: TRANSITION_VERB_ID,
     kind: "action",
-    arguments: ARGUMENTS6,
+    arguments: ARGUMENTS7,
     writes: [TRANSITION_WRITE],
     plan: (request) => planTransitions(host, request),
     apply: (request) => applyTransitions(host, request, clock)
@@ -2291,7 +2624,7 @@ function transitionVerb(host, clock = systemClock) {
 async function planTransitions(host, request) {
   const { table } = request;
   const to = String(request.arguments["to"] ?? "").trim();
-  if (to === "") return planRefused(problem5("needs to=, the status to move each issue to"));
+  if (to === "") return planRefused(problem6("needs to=, the status to move each issue to"));
   const workflowName = request.arguments["workflow"];
   let workflow;
   if (workflowName !== void 0) {
@@ -2301,7 +2634,7 @@ async function planTransitions(host, request) {
     if (read.value === void 0) {
       const known = workflowNames(request.section);
       return planRefused(
-        problem5(
+        problem6(
           `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`)
         )
       );
@@ -2311,7 +2644,7 @@ async function planTransitions(host, request) {
   const status = columnNamed(table, "status");
   if (status === void 0) {
     return planRefused(
-      problem5("needs the status column jira.pull answers, to know where each issue starts")
+      problem6("needs the status column jira.pull answers, to know where each issue starts")
     );
   }
   const config = await resolveJiraConfig(host, request.section);
@@ -2381,9 +2714,9 @@ function unreachable(workflow, from, to, reached) {
   return `E_JIRA_CONFIG: workflow ${workflow} has no path from ${from} to ${to}; ${tried}`;
 }
 function applyTransitions(host, request, clock = systemClock) {
-  return applyBatch(host, request, { decode: decode4, write: walk }, clock);
+  return applyBatch(host, request, { decode: decode5, write: walk }, clock);
 }
-function decode4(payload) {
+function decode5(payload) {
   const { k, f, p } = payload;
   if (typeof k !== "string" || typeof f !== "string" || !Array.isArray(p) || p.length === 0) {
     return void 0;
@@ -2462,7 +2795,7 @@ async function transitionsOf(client, key) {
 function named(transition) {
   return `${transition.name} (to ${transition.to})`;
 }
-function problem5(text2) {
+function problem6(text2) {
   return argumentsProblem(text2, TRANSITION_VERB_ID);
 }
 
@@ -2475,7 +2808,8 @@ function activate(host) {
     host.registerRecipeVerb(transitionVerb(host)),
     host.registerRecipeVerb(assignVerb(host)),
     host.registerRecipeVerb(setVerb(host)),
-    host.registerRecipeVerb(commentVerb(host))
+    host.registerRecipeVerb(commentVerb(host)),
+    host.registerRecipeVerb(createVerb(host))
   ];
   return {
     dispose() {
