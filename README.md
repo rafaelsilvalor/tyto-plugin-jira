@@ -1,47 +1,73 @@
 # tyto-plugin-jira
 
-A [Tyto](https://github.com/rafaelsilvalor/tyto) plugin that will read Jira Cloud issues into a
+A [Tyto](https://github.com/rafaelsilvalor/tyto) plugin that reads Jira Cloud issues into a
 recipe. Tyto knows no provider (Tyto ADR 0011, ADR 0127): everything Jira-specific lives here,
 in its own repository, and reaches Tyto only through the plugin API. This repository is public
 and unlicensed.
 
-## Status
+It adds two recipe verbs:
 
-**`jira.pull` works, with its fifteen fixed columns, mapped fields and a page cache, and so
-does `jira.refresh`.** A recipe
-step names exactly one of `jql=`, `board=`, `keys=` or `parent=`, and `max=` (10,000 unless
-written, at most 100,000):
+- **`jira.pull`**, a source: the issues a JQL query, a board, a list of keys or a parent names,
+  as a table.
+- **`jira.refresh`**, a transform: the table it is handed, with each row that names an issue
+  filled with what Jira holds now.
 
-```
-jira.pull jql="project = EX AND status != Done"
-```
+**It only reads.** Neither verb changes anything in Jira; the verbs that write (transitions,
+fields, assignees, comments, new issues) are not here yet.
 
-It answers `key`, `url`, `project`, `issuetype`, `status`, `status_category`, `summary`,
-`parent_key`, `assignee`, `labels`, `created`, `updated` (both ISO 8601 in UTC),
-`description_urls`, `comment_urls` and `parent_description_urls`. A board is pulled by its
-saved filter; a Kanban board's sub-query is not applied. More issues than `max=` is an error,
-never a shorter table.
+Every example below is invented: `example.atlassian.net`, project `EX`, issues `EX-1`, `EX-2`.
 
-`jira.refresh [by=<column>] [only=<boolean column>] [children=true]` fills the table it is
-handed with what Jira holds now, in the same columns, so a row `recall` brought back gets its
-current values:
+## Install
+
+From the gallery, when the gallery you read lists it: **Gallery: Browse Templates and
+Plugins**, then **Install** on its card, or `tyto gallery install <id>` in a terminal. Or
+straight from this repository:
 
 ```
-recall waiting mark=recalled
-jira.refresh only=recalled children=true
+tyto plugin install git+https://github.com/rafaelsilvalor/tyto-plugin-jira.git
 ```
 
-It reads the issue key from the row's key, or from `by=`; `only=` limits it to the rows where
-that column is true; `children=true` adds every child of the refreshed issues. A deleted issue
-keeps its row with empty Jira columns, and a moved one keeps its row key. One call refreshes
-at most 1,000 issues and 5,000 children within 25 s, and past any of them answers an error,
-never a partial table. It always reads Jira; it uses no cache. Not yet working: the user
-documentation and a check against a real site.
+Tyto copies the folder and never builds it, so `dist/index.js` is committed. Either way, the
+install shows the permissions below and asks for your approval.
 
-## Mapped fields
+### What it may reach
 
-Any other Jira field becomes a column, after the fixed ones, when the `jira` section of
-`.tyto/project.json` maps a column name to the field's id:
+| Permission              | Why                                                        |
+| ----------------------- | ---------------------------------------------------------- |
+| `net:*.atlassian.net`   | Jira Cloud's REST API, on any `<site>.atlassian.net`.      |
+| `credentials:api-token` | The Atlassian API token, kept by Tyto and never in a file. |
+| `credentials:email`     | The email the token belongs to, kept by Tyto the same way. |
+
+**Only Jira Cloud on `atlassian.net`.** A site on a custom domain, and Jira Data Center or
+Server, are out: the permission does not reach them, and widening it would mean asking every
+person who installs the plugin for more than Jira Cloud needs.
+
+## Credentials
+
+The plugin signs in with an Atlassian API token and the email of the account it belongs to.
+Create the token at <https://id.atlassian.com/manage-profile/security/api-tokens>. The plugin
+reads with that account's permissions, so it sees exactly the issues the account sees.
+
+| Where        | API token                                    | Email                                                  |
+| ------------ | -------------------------------------------- | ------------------------------------------------------ |
+| Command line | `TYTO_PLUGIN_JIRA_API_TOKEN`                 | `TYTO_PLUGIN_JIRA_EMAIL`                               |
+| Desktop app  | the system keychain, from the plugins screen | the keychain the same way, or the `jira.email` setting |
+
+On the command line a credential is an environment variable and nothing else. In the desktop
+app it is stored from the plugins screen, beside the plugin, and never written to a file.
+
+Two settings, in the desktop's `settings.json`:
+
+- `jira.baseUrl`: the site, such as `https://example.atlassian.net`. A workspace may name its
+  own in the `jira` section of `.tyto/project.json`, which wins.
+- `jira.email`: the email, used only when no `email` credential is stored.
+
+**The token is never a setting, and your email never goes in `.tyto/project.json`.** A setting
+is plain text people paste into bug reports, and the project file is shared by a whole team.
+
+## The `jira` section of `.tyto/project.json`
+
+A workspace says which site it works with, and which extra fields become columns:
 
 ```json
 {
@@ -52,10 +78,68 @@ Any other Jira field becomes a column, after the fixed ones, when the `jira` sec
 }
 ```
 
-A column name is lower case letters, digits and `_`, starting with a letter, and is not one of
-the fifteen fixed columns. The id must be one the site has: the first page of a pull reads the
-site's field catalogue (`GET /rest/api/3/field`), and a name written where the id belongs is
-refused with the id it should have been. The catalogue's `schema.type` gives the column's type:
+- `baseUrl`: the site, `https://<site>.atlassian.net`, with no path. It wins over the
+  `jira.baseUrl` setting.
+- `fields`: a column name for each Jira field id. See [Mapped fields](#mapped-fields).
+
+A `workflows` key, the transition graph a write verb walks, arrives with the verbs that write;
+today the section has these two.
+
+## `jira.pull`
+
+A source: it starts a recipe, and names exactly one of four selectors.
+
+```
+jira.pull jql="project = EX AND status != Done"
+jira.pull board=12
+jira.pull keys="EX-1,EX-2,EX-7"
+jira.pull parent=EX-1
+```
+
+| Argument  | What it reads                                                               |
+| --------- | --------------------------------------------------------------------------- |
+| `jql=`    | the issues a JQL query answers, in its order                                |
+| `board=`  | a board, by its number, through its saved filter                            |
+| `keys=`   | the issues of a comma-separated list of keys                                |
+| `parent=` | the children of one issue                                                   |
+| `max=`    | the most issues the step may answer: 10,000 unless written, at most 100,000 |
+
+A board is pulled by its saved filter; a Kanban board's sub-query (the rule that hides old
+done issues from the board) is not applied. **More issues than `max=` is an error, never a
+shorter table.**
+
+### The fifteen columns
+
+Every pull answers these columns, in this order:
+
+| Column                    | Type       | Value                                                 |
+| ------------------------- | ---------- | ----------------------------------------------------- |
+| `key`                     | `text`     | the issue key, `EX-1`; also the row's key             |
+| `url`                     | `link`     | `https://example.atlassian.net/browse/EX-1`           |
+| `project`                 | `text`     | the project key, `EX`                                 |
+| `issuetype`               | `text`     | `Task`, `Story`, `Epic`…                              |
+| `status`                  | `text`     | the status name                                       |
+| `status_category`         | `text`     | `To Do`, `In Progress` or `Done`                      |
+| `summary`                 | `text`     | the summary                                           |
+| `parent_key`              | `text`     | the parent's key, or empty                            |
+| `assignee`                | `text`     | the assignee's display name, or empty                 |
+| `labels`                  | `list`     | the labels                                            |
+| `created`                 | `datetime` | ISO 8601 in UTC                                       |
+| `updated`                 | `datetime` | ISO 8601 in UTC                                       |
+| `description_urls`        | `list`     | every link in the description, first occurrence first |
+| `comment_urls`            | `list`     | every link in every comment                           |
+| `parent_description_urls` | `list`     | every link in the parent's description                |
+
+Each row's provenance is `{source: "jira", id: <the issue's id>, fetchedAt}`.
+
+### Mapped fields
+
+Any other Jira field becomes a column, after the fixed ones, when the `fields` of the `jira`
+section maps a column name to the field's id. A column name is lower case letters, digits and
+`_`, starting with a letter, and is not one of the fifteen fixed columns. The id must be one the
+site has: the first page of a pull reads the site's field catalogue (`GET /rest/api/3/field`),
+and a name written where the id belongs is refused with the id it should have been. The
+catalogue's `schema.type` gives the column's type:
 
 | Jira type                               | Column     | Value                                       |
 | --------------------------------------- | ---------- | ------------------------------------------- |
@@ -68,52 +152,122 @@ refused with the id it should have been. The catalogue's `schema.type` gives the
 
 A section edited between two pages of one pull is refused rather than stitched together.
 
+## `jira.refresh`
+
+A transform: it takes the table the steps before it made, and fills each row that names an
+issue with what Jira holds now, in the same columns `jira.pull` answers.
+
+```
+jira.refresh [by=<column>] [only=<boolean column>] [children=true]
+```
+
+| Argument        | What it does                                                                       |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `by=`           | reads the issue key from this text column instead of the row's key                 |
+| `only=`         | refreshes only the rows where this boolean column is true, such as `recall`'s mark |
+| `children=true` | adds every child of the refreshed issues, so `rollup` sees them all                |
+
+- A column the table lacks is added; a column of the same name and another type is refused,
+  so rename it before the step. Columns of your own, and rows `only=` leaves out, pass through
+  unchanged.
+- **A deleted issue keeps its row**, with its Jira columns empty, so a recipe can see it went.
+  A moved issue (another project, another key) keeps its row key, and its `key` and `url`
+  columns show where it is now.
+- A child already in the table is updated in place; a new one is added. Every refreshed row's
+  provenance is `{source: "jira.refresh", id: <key>, fetchedAt}`.
+- It always reads Jira; it uses no cache.
+
+## A worked recipe: what left the query
+
+A recipe that lists the issues waiting on review, and also the ones that were waiting at the
+last applied run and have moved on since, with their status now:
+
+```
+recipe review-queue
+  | Issues waiting on review, and those that left the queue since the last run.
+
+jira.pull jql="project = EX AND labels = review"
+recall review mark=recalled
+jira.refresh only=recalled children=true
+rollup open_children parent=parent_key when="status_category != Done"
+remember review columns=status
+show table
+```
+
+1. `jira.pull` brings the issues the query answers now.
+2. `recall review mark=recalled` appends a row for every key the `review` store holds that the
+   table lacks (an issue that left the query), and marks those rows in a `recalled` column.
+3. `jira.refresh only=recalled children=true` reads those issues from Jira, so a recalled row
+   shows its current status instead of nothing, and adds their children.
+4. `rollup` counts, on each parent, the children that are not done.
+5. `remember review columns=status` stores the rows when the run is applied, for the next
+   run's `recall`.
+
 ## The page cache
 
-Each page's raw Jira answers (the search, the comment pages and the parents) are kept in the
-plugin's private cache in Tyto, never in the workspace, so running a recipe again within ten
-minutes asks Jira nothing; a board's filter and the field catalogue are still read. An entry
-is used only for the same site, account, query, fields and page, and only when the first page
-of the run came from the same fill, so one table never mixes two reads of Jira. Rows from the
-cache carry the time the page was stored as their `fetchedAt`. Running again without cache
-reads Jira and refills it. **The cache never fails a pull:** when Tyto cannot read or store an
-entry, the plugin logs a warning and reads Jira.
+Each page of a `jira.pull` keeps Jira's raw answers (the search, the comment pages and the
+parents) in the plugin's private cache in Tyto, never in the workspace, so running a recipe
+again **within ten minutes** asks Jira nothing; a board's filter and the field catalogue are
+still read. An entry is used only for the same site, account, query, fields and page, and only
+when the first page of the run came from the same fill, so one table never mixes two reads of
+Jira. Rows from the cache carry the time the page was stored as their `fetchedAt`.
 
-## Install into Tyto
+To read Jira now, run the recipe fetching again (**Run recipe, fetching again** in the
+desktop): the pull skips the cache and refills it. `jira.refresh` never uses the cache. **The
+cache never fails a pull:** when Tyto cannot read or store an entry, the plugin logs a warning
+and reads Jira.
 
+## Limits
+
+| Limit                          | Value                                                       |
+| ------------------------------ | ----------------------------------------------------------- |
+| Issues per `jira.pull` step    | `max=`, 10,000 unless written, at most 100,000              |
+| Issues per search page         | 50; the host asks for each page in its own call             |
+| Issues per `jira.refresh` step | 1,000                                                       |
+| Children per `jira.refresh`    | 5,000                                                       |
+| Time per `jira.refresh` step   | 25 s, under the host's 30 s for one call                    |
+| Retries on 429 and 503         | 3, waiting 1, 2 and 4 s, or Jira's `Retry-After` up to 30 s |
+| Cache entry                    | 32 MiB; a larger page is read live and not stored           |
+
+**Past a limit, a step is an error, never a partial table.** A refresh past its ceilings says
+so and asks you to narrow it with `only=`.
+
+## Errors
+
+A failure reaches the recipe as Tyto's `E_RECIPE_VERB`, its message starting with the verb and
+the plugin's own code, such as `'jira.pull' failed: E_JIRA_AUTH: …`. Arguments that do not say
+what to read, or name a column the table lacks, are `E_RECIPE_ARGUMENTS`.
+
+| Code              | What happened                                                                                    | What to do                                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `E_JIRA_CONFIG`   | No site, token or email; a site that is not Jira Cloud; a `fields` entry the site does not have. | Set what the message names: the site, the credential, or the field id it suggests.                               |
+| `E_JIRA_AUTH`     | Jira refused the token (401) or the account (403).                                               | 401: create a token and store it again. 403: check the account may see the project, or sign in on the site once. |
+| `E_JIRA_REDIRECT` | Jira answered a redirect, which is never followed.                                               | Check the site is the Jira Cloud address itself.                                                                 |
+| `E_JIRA_HTTP`     | Any other failed answer, a 429 or 503 still failing after its retries included.                  | Read Jira's own words in the message, such as a JQL mistake. Try a 429 or 503 again later.                       |
+| `E_JIRA_NETWORK`  | No answer: Tyto refused the request, or the network failed.                                      | Check the connection. A refusal by Tyto names its own code, such as `E_PERMISSION`.                              |
+| `E_JIRA_RESPONSE` | Jira answered something that is not what its API promises.                                       | Run again; if it stays, report it with the message.                                                              |
+
+No message carries the API token, even when Jira echoes it.
+
+## Checking against a real site
+
+`tests/live.test.ts` runs both verbs against a real Jira Cloud site, and only when three
+environment variables name one. Without them it is skipped, which is what CI does:
+
+```sh
+JIRA_LIVE_BASE_URL=https://<site>.atlassian.net \
+JIRA_LIVE_EMAIL=<email> \
+JIRA_LIVE_TOKEN=<api-token> \
+JIRA_LIVE_JQL='project = <KEY> ORDER BY updated DESC' \
+pnpm test:live
 ```
-tyto plugin install https://github.com/rafaelsilvalor/tyto-plugin-jira
-```
 
-Tyto copies the folder into `~/.tyto/plugins/` and never builds it, so `dist/index.js` is
-committed. The install shows the permissions below and asks for your approval.
-
-## What it may reach
-
-| Permission              | Why                                                        |
-| ----------------------- | ---------------------------------------------------------- |
-| `net:*.atlassian.net`   | Jira Cloud's REST API, on any `<site>.atlassian.net`.      |
-| `credentials:api-token` | The Atlassian API token, kept by Tyto and never in a file. |
-| `credentials:email`     | The email the token belongs to, kept by Tyto the same way. |
-
-**Only Jira Cloud on `atlassian.net`.** A site on a custom domain, and Jira Data Center or
-Server, are out: the permission does not reach them, and widening it would mean asking every
-person who installs the plugin for more than Jira Cloud needs.
-
-## Credentials and settings
-
-On the command line, Tyto reads the credentials from the environment:
-`TYTO_PLUGIN_JIRA_API_TOKEN` and `TYTO_PLUGIN_JIRA_EMAIL`. In the desktop app they are stored
-in the system keychain.
-
-Two settings, in the desktop's `settings.json`:
-
-- `jira.baseUrl`: the site, such as `https://example.atlassian.net`. A workspace may name its
-  own in the `jira` section of `.tyto/project.json`, which wins.
-- `jira.email`: the desktop's fallback for the email when it is not stored as a credential.
-
-**The token is never a setting, and your email never goes in `.tyto/project.json`.** A setting
-is plain text people paste into bug reports, and the project file is shared by a whole team.
+`JIRA_LIVE_JQL` is optional, `updated >= -7d ORDER BY updated DESC` when unset. The check signs
+in through `/rest/api/3/myself`, takes the first 20 issues the query answers, pulls them with
+`jira.pull jql="key in (...)"`, and refreshes three of them with `jira.refresh`. It asserts the
+shape of the answers (the columns, their types, non-empty keys, the provenance), never a value,
+and prints only counts. `pnpm test:live` builds first, because the verbs run from
+`dist/index.js`.
 
 ## Development
 
@@ -131,8 +285,9 @@ echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' >> ~/.npmrc
 NODE_AUTH_TOKEN=$(gh auth token) pnpm install
 ```
 
-The plugin imports only types from it, so the bundle does not change. The tests run the committed `dist/index.js` through the contract's own
-harness, `@tyto/plugin-api/testing` (Tyto ADR 0150): build before you test.
+The plugin imports only types from it, so the bundle does not change. The tests run the
+committed `dist/index.js` through the contract's own harness, `@tyto/plugin-api/testing` (Tyto
+ADR 0150): build before you test.
 
 The `contract` workflow runs every Monday, and on demand, against the newest published
 contract rather than the range in `package.json`: a red run there is a Tyto release this plugin
