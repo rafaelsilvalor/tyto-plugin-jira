@@ -177,12 +177,12 @@ function createJiraClient(options) {
         );
       }
       if (RETRIED_STATUSES.has(response.status)) {
-        const wait2 = retryWait(response, retry);
-        if (retry < MAX_RETRIES && wait2.milliseconds !== void 0) {
-          await sleep(wait2.milliseconds);
+        const wait3 = retryWait(response, retry);
+        if (retry < MAX_RETRIES && wait3.milliseconds !== void 0) {
+          await sleep(wait3.milliseconds);
           continue;
         }
-        const why = wait2.milliseconds === void 0 ? `Jira asked to wait ${wait2.seconds} s, longer than the ${MAX_RETRY_AFTER_SECONDS} s this plugin waits` : `still so after ${MAX_RETRIES} retries`;
+        const why = wait3.milliseconds === void 0 ? `Jira asked to wait ${wait3.seconds} s, longer than the ${MAX_RETRY_AFTER_SECONDS} s this plugin waits` : `still so after ${MAX_RETRIES} retries`;
         return jiraError(
           "E_JIRA_HTTP",
           redact(`${label} answered ${statusOf(response)}: ${why}. Try again later.`),
@@ -195,6 +195,7 @@ function createJiraClient(options) {
   return {
     get: (path, query) => request("GET", path, query, void 0),
     post: (path, body) => request("POST", path, void 0, body),
+    put: (path, body) => request("PUT", path, void 0, body),
     async myself() {
       const answer = await request("GET", "/rest/api/3/myself", void 0, void 0);
       if (!answer.ok) return answer;
@@ -488,6 +489,8 @@ function recordingClient(client) {
         if (answer.ok) kept(path, answer.value);
         return answer;
       },
+      // A page only reads: a write passes through, never recorded.
+      put: (path, body) => client.put(path, body),
       myself: () => client.myself()
     },
     raw: () => ({ search, comments, parents })
@@ -510,6 +513,7 @@ function replayingClient(raw) {
   return {
     get: async (path, _query) => answer(path),
     post: async (path) => answer(path),
+    put: async () => missing(),
     myself: async () => missing()
   };
 }
@@ -628,6 +632,7 @@ function nonEmptyString(value) {
 // src/diagnostics.ts
 var VERB_ID = "jira.pull";
 var REFRESH_VERB_ID = "jira.refresh";
+var TRANSITION_VERB_ID = "jira.transition";
 function verbFailed(error, verb = VERB_ID) {
   return {
     severity: "error",
@@ -635,11 +640,11 @@ function verbFailed(error, verb = VERB_ID) {
     message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
   };
 }
-function argumentsProblem(problem2, verb = VERB_ID) {
+function argumentsProblem(problem3, verb = VERB_ID) {
   return {
     severity: "error",
     code: "E_RECIPE_ARGUMENTS",
-    message: `'${verb}' ${withoutFinalStop(problem2)}.`
+    message: `'${verb}' ${withoutFinalStop(problem3)}.`
   };
 }
 function failed(diagnostic) {
@@ -702,11 +707,11 @@ async function mappedTypes(client, mapped) {
 }
 function unknownField(column, written, catalogue) {
   const lowered = written.toLowerCase();
-  const named = catalogue.filter((field) => typeof field["name"] === "string" && field["name"].toLowerCase() === lowered).map((field) => field["id"]).filter((id) => typeof id === "string");
-  if (named.length === 0) {
+  const named2 = catalogue.filter((field) => typeof field["name"] === "string" && field["name"].toLowerCase() === lowered).map((field) => field["id"]).filter((id) => typeof id === "string");
+  if (named2.length === 0) {
     return `fields maps ${column} to '${written}', and this site has no field with that id`;
   }
-  return `fields maps ${column} to '${written}', which is a field's name, not its id; write ` + named.join(" or ");
+  return `fields maps ${column} to '${written}', which is a field's name, not its id; write ` + named2.join(" or ");
 }
 function typeOfSchema(type) {
   switch (type) {
@@ -883,10 +888,10 @@ async function commentBodies(client, issue) {
       maxResults: COMMENT_PAGE_SIZE
     });
     if (!page.ok) return page;
-    const answered = record(page.value)?.["comments"];
-    if (!Array.isArray(answered)) return shapeError(`GET ${path} answered no comments list`);
-    if (answered.length === 0) break;
-    bodies.push(...answered.map((comment) => record(comment)?.["body"]));
+    const answered2 = record(page.value)?.["comments"];
+    if (!Array.isArray(answered2)) return shapeError(`GET ${path} answered no comments list`);
+    if (answered2.length === 0) break;
+    bodies.push(...answered2.map((comment) => record(comment)?.["body"]));
   }
   return jiraOk(bodies);
 }
@@ -928,8 +933,8 @@ async function bulkIssues(client, idsOrKeys, fields) {
     }
     const errors = body?.["issueErrors"];
     for (const error of Array.isArray(errors) ? errors : []) {
-      const named = record(error)?.["issueIdsOrKeys"];
-      for (const key of Array.isArray(named) ? named : []) {
+      const named2 = record(error)?.["issueIdsOrKeys"];
+      for (const key of Array.isArray(named2) ? named2 : []) {
         if (typeof key === "string") refused2.add(key);
       }
     }
@@ -1340,9 +1345,9 @@ function readArguments(request) {
   return { by, only, children: request.arguments["children"] === true };
 }
 async function fetchIssues(client, keys, fields) {
-  const answered = await bulkIssues(client, keys, fields);
-  if (!answered.ok) return answered;
-  const byKey = new Map(answered.value.issues.map((issue) => [issue.key, issue]));
+  const answered2 = await bulkIssues(client, keys, fields);
+  if (!answered2.ok) return answered2;
+  const byKey = new Map(answered2.value.issues.map((issue) => [issue.key, issue]));
   const found = /* @__PURE__ */ new Map();
   for (const key of keys) {
     const issue = byKey.get(key);
@@ -1350,7 +1355,7 @@ async function fetchIssues(client, keys, fields) {
       found.set(key, issue);
       continue;
     }
-    if (answered.value.refused.has(key)) continue;
+    if (answered2.value.refused.has(key)) continue;
     const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
     const single = await client.get(path, { fields: fields.join(",") });
     if (!single.ok) {
@@ -1425,12 +1430,450 @@ var SETTINGS = [
   }
 ];
 
+// src/write/plan.ts
+var MAX_DESCRIPTION_LENGTH = 500;
+var MAX_PAYLOAD_BYTES = 2048;
+function plannedOperation(write, rowKey, description, payload) {
+  const bytes = payloadBytes(payload);
+  if (bytes > MAX_PAYLOAD_BYTES) {
+    const key = typeof payload["k"] === "string" ? `${payload["k"]}: ` : "";
+    return plannedFailure(
+      write,
+      rowKey,
+      description,
+      `E_JIRA_PLAN: ${key}this write needs ${bytes.toLocaleString("en-US")} bytes to be kept with the plan, over the ${MAX_PAYLOAD_BYTES.toLocaleString("en-US")} a plan keeps per row; shorten what it writes`
+    );
+  }
+  return { write, rowKey, description: shortened(description), payload };
+}
+function plannedFailure(write, rowKey, description, reason) {
+  return {
+    write,
+    rowKey,
+    description: shortened(`${description} (will fail: ${reason})`),
+    payload: { x: shortened(reason) }
+  };
+}
+function issueKeyOf(row) {
+  for (const candidate of [row.values["key"], row.key]) {
+    const key = typeof candidate === "string" ? candidate.trim() : void 0;
+    if (key !== void 0 && ISSUE_KEY.test(key)) return key;
+  }
+  return void 0;
+}
+function columnNamed(table, name) {
+  const wanted = name.toLowerCase();
+  return table.columns.find((column) => column.name.toLowerCase() === wanted);
+}
+function planOf(target, operations) {
+  const plan = { target, operations, count: operations.length };
+  return { ok: true, value: plan, diagnostics: [] };
+}
+function planRefused(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function payloadBytes(payload) {
+  return new TextEncoder().encode(JSON.stringify(payload)).byteLength;
+}
+function shortened(text2, limit = MAX_DESCRIPTION_LENGTH) {
+  return text2.length <= limit ? text2 : `${text2.slice(0, limit - 1)}\u2026`;
+}
+
+// src/write/apply.ts
+var systemClock2 = { now: () => Date.now() };
+var APPLY_BUDGET_MILLISECONDS = 2e4;
+var NOT_REACHED = "not reached in this call's time; run the cell and Apply again";
+var DRIFT_FIELDS = ["status", "assignee", "updated"];
+async function applyBatch(host, request, verb, clock = systemClock2) {
+  const { operations } = request;
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return answered(operations.map(() => failedWith(config.error)));
+  const redact = (text2) => config.value.token === "" ? text2 : text2.split(config.value.token).join("[redacted]");
+  const finished = (outcome) => outcome.reason === void 0 ? outcome : { ...outcome, reason: shortened(redact(outcome.reason)) };
+  const deadline = clock.now() + APPLY_BUDGET_MILLISECONDS;
+  let outOfTime = false;
+  const client = createJiraClient({
+    config: config.value,
+    fetch: (url, init) => {
+      if (outOfTime || clock.now() > deadline) {
+        outOfTime = true;
+        return Promise.reject(new Error(NOT_REACHED));
+      }
+      return host.fetch(url, init);
+    },
+    sleep: async (milliseconds) => {
+      if (clock.now() + milliseconds > deadline) outOfTime = true;
+      else await (clock.sleep ?? wait2)(milliseconds);
+    }
+  });
+  const decoded = operations.map((operation) => decodeOperation(operation.payload, verb));
+  const keys = [
+    ...new Set(
+      decoded.flatMap((each) => typeof each === "object" && "k" in each ? [each.k] : [])
+    )
+  ];
+  const read = keys.length === 0 ? jiraOk(/* @__PURE__ */ new Map()) : await currentIssues(client, keys);
+  const context = read.ok ? { client, config: config.value, current: read.value } : void 0;
+  let refused2;
+  const outcomes = [];
+  for (const each of decoded) {
+    if (typeof each === "string") {
+      outcomes.push(finished({ status: "failed", reason: each }));
+      continue;
+    }
+    if (!read.ok) {
+      outcomes.push(finished(failedWith(read.error)));
+      continue;
+    }
+    if (outOfTime || clock.now() > deadline) {
+      outOfTime = true;
+      outcomes.push({ status: "skipped", reason: NOT_REACHED });
+      continue;
+    }
+    if (refused2 !== void 0) {
+      outcomes.push(finished({ status: "failed", reason: refused2 }));
+      continue;
+    }
+    const issue = context?.current.get(each.k);
+    if (issue === void 0 || context === void 0) {
+      outcomes.push(
+        finished({
+          status: "failed",
+          reason: `E_JIRA_MOVED: ${each.k} was not found; it may have been deleted, moved to another project or hidden from this account since the plan`
+        })
+      );
+      continue;
+    }
+    const outcome = finished(await verb.write(each, issue, context));
+    if (outcome.status === "failed" && outcome.reason?.startsWith("E_JIRA_AUTH") === true) {
+      refused2 = outcome.reason;
+    }
+    outcomes.push(outcome);
+  }
+  return answered(outcomes);
+}
+function decodeOperation(payload, verb) {
+  const object = record(payload);
+  if (object === void 0) return UNREADABLE;
+  const planned = object["x"];
+  if (typeof planned === "string") return planned;
+  return verb.decode(object) ?? UNREADABLE;
+}
+var UNREADABLE = "E_JIRA_PLAN: this operation carries no payload this version of the plugin reads; run the cell again";
+async function currentIssues(client, keys) {
+  const found = /* @__PURE__ */ new Map();
+  const jql = `key in (${keys.join(", ")})`;
+  let token;
+  for (; ; ) {
+    const page = await searchPage(client, jql, DRIFT_FIELDS, token);
+    if (!page.ok) return page;
+    for (const issue of page.value.issues) {
+      const status = record(issue.fields["status"])?.["name"];
+      const assignee = record(issue.fields["assignee"]);
+      const accountId = assignee?.["accountId"];
+      const displayName = assignee?.["displayName"];
+      const updated = issue.fields["updated"];
+      found.set(issue.key, {
+        key: issue.key,
+        status: typeof status === "string" ? status : null,
+        assignee: typeof accountId === "string" ? { accountId, displayName: typeof displayName === "string" ? displayName : null } : null,
+        updated: typeof updated === "string" ? updated : null
+      });
+    }
+    const next = page.value.nextPageToken;
+    if (page.value.isLast || next === void 0) return jiraOk(found);
+    if (next === token) {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        "the search for the batch answered the token it was given."
+      );
+    }
+    token = next;
+  }
+}
+function failedWith(error, suffix = "") {
+  return { status: "failed", reason: `${describeJiraError(error)}${suffix}` };
+}
+function answered(operations) {
+  return { ok: true, value: { operations }, diagnostics: [] };
+}
+function same(left, right) {
+  return (left ?? "").trim().toLowerCase() === (right ?? "").trim().toLowerCase();
+}
+var wait2 = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// src/write/workflows.ts
+function workflowOf(section, name) {
+  const written = record(section)?.["workflows"];
+  if (written === void 0 || written === null) return jiraOk(void 0);
+  const workflows = record(written);
+  if (workflows === void 0) {
+    return configError2(
+      'workflows in the jira section of .tyto/project.json is not an object of workflow names, such as {"delivery": {"To Do": ["In Progress"]}}'
+    );
+  }
+  const entry = Object.entries(workflows).find(([each]) => each === name);
+  if (entry === void 0) return jiraOk(void 0);
+  const graph = record(entry[1]);
+  if (graph === void 0) {
+    return configError2(
+      `workflow ${name} is not an object of statuses, such as {"To Do": ["In Progress"]}`
+    );
+  }
+  const steps = /* @__PURE__ */ new Map();
+  for (const [from, targets] of Object.entries(graph)) {
+    if (from.trim() === "" || !Array.isArray(targets) || !targets.every((target) => typeof target === "string" && target.trim() !== "")) {
+      return configError2(
+        `workflow ${name} maps ${JSON.stringify(from)} to ${JSON.stringify(targets)}; each status maps to a list of status names, such as "To Do": ["In Progress"]`
+      );
+    }
+    const key = from.trim().toLowerCase();
+    const known = steps.get(key);
+    const next = targets.map((target) => target.trim());
+    if (known === void 0) steps.set(key, { name: from.trim(), next });
+    else known.next.push(...next);
+  }
+  return jiraOk({ name, steps });
+}
+function workflowNames(section) {
+  const workflows = record(record(section)?.["workflows"]);
+  return workflows === void 0 ? [] : Object.keys(workflows);
+}
+function shortestPath(workflow, from, to) {
+  const start = from.trim().toLowerCase();
+  const goal = to.trim().toLowerCase();
+  const previous = /* @__PURE__ */ new Map([[start, null]]);
+  const names = /* @__PURE__ */ new Map([[start, from.trim()]]);
+  const queue = [start];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === goal) {
+      const path = [];
+      for (let at = current; at !== null && at !== start; ) {
+        path.unshift(names.get(at) ?? at);
+        at = previous.get(at) ?? null;
+      }
+      return { found: true, path };
+    }
+    for (const next of workflow.steps.get(current)?.next ?? []) {
+      const key = next.toLowerCase();
+      if (previous.has(key)) continue;
+      previous.set(key, current);
+      names.set(key, workflow.steps.get(key)?.name ?? next);
+      queue.push(key);
+    }
+  }
+  return {
+    found: false,
+    reached: [...names.entries()].filter(([key]) => key !== start).map(([, name]) => name)
+  };
+}
+function configError2(message) {
+  return jiraError("E_JIRA_CONFIG", message);
+}
+
+// src/transition.ts
+var TRANSITION_WRITE = "transition";
+var ARGUMENTS3 = [
+  { name: "to", type: "text", required: true },
+  { name: "workflow", type: "text" }
+];
+var REACHED_NAMED = 12;
+function transitionVerb(host, clock = systemClock2) {
+  return {
+    id: TRANSITION_VERB_ID,
+    kind: "action",
+    arguments: ARGUMENTS3,
+    writes: [TRANSITION_WRITE],
+    plan: (request) => planTransitions(host, request),
+    apply: (request) => applyTransitions(host, request, clock)
+  };
+}
+async function planTransitions(host, request) {
+  const { table } = request;
+  const to = String(request.arguments["to"] ?? "").trim();
+  if (to === "") return planRefused(problem2("needs to=, the status to move each issue to"));
+  const workflowName = request.arguments["workflow"];
+  let workflow;
+  if (workflowName !== void 0) {
+    const name = String(workflowName).trim();
+    const read = workflowOf(request.section, name);
+    if (!read.ok) return planRefused(verbFailed(read.error, TRANSITION_VERB_ID));
+    if (read.value === void 0) {
+      const known = workflowNames(request.section);
+      return planRefused(
+        problem2(
+          `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`)
+        )
+      );
+    }
+    workflow = read.value;
+  }
+  const status = columnNamed(table, "status");
+  if (status === void 0) {
+    return planRefused(
+      problem2("needs the status column jira.pull answers, to know where each issue starts")
+    );
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return planRefused(verbFailed(config.error, TRANSITION_VERB_ID));
+  const operations = [];
+  for (const row of table.rows) {
+    const key = issueKeyOf(row);
+    if (key === void 0) {
+      operations.push(
+        plannedFailure(
+          TRANSITION_WRITE,
+          row.key,
+          `${row.key} \u2192 ${to}`,
+          `E_JIRA_PLAN: row ${row.key} names no issue key in its key column or its key`
+        )
+      );
+      continue;
+    }
+    const from = row.values[status.name];
+    if (typeof from !== "string" || from.trim() === "") {
+      operations.push(
+        plannedFailure(
+          TRANSITION_WRITE,
+          row.key,
+          `${key} \u2192 ${to}`,
+          `E_JIRA_PLAN: ${key} has no status in the table`
+        )
+      );
+      continue;
+    }
+    if (same(from, to)) continue;
+    let path = [to];
+    if (workflow !== void 0) {
+      const found = shortestPath(workflow, from, to);
+      if (!found.found) {
+        operations.push(
+          plannedFailure(
+            TRANSITION_WRITE,
+            row.key,
+            `${key}: ${from} \u2192 ${to}`,
+            unreachable(workflow.name, from, to, found.reached)
+          )
+        );
+        continue;
+      }
+      path = found.path;
+    }
+    const payload = {
+      k: key,
+      f: from,
+      p: path,
+      ...workflow === void 0 ? {} : { w: workflow.name }
+    };
+    operations.push(
+      plannedOperation(
+        TRANSITION_WRITE,
+        row.key,
+        `${key}: ${[from, ...path].join(" \u2192 ")}`,
+        payload
+      )
+    );
+  }
+  return planOf(`Jira ${new URL(config.value.baseUrl).hostname}`, operations);
+}
+function unreachable(workflow, from, to, reached) {
+  const tried = reached.length === 0 ? `${from} has no transition in it` : `the paths tried from ${from} reach only ${reached.slice(0, REACHED_NAMED).join(", ")}` + (reached.length > REACHED_NAMED ? ` and ${reached.length - REACHED_NAMED} more` : "");
+  return `E_JIRA_CONFIG: workflow ${workflow} has no path from ${from} to ${to}; ${tried}`;
+}
+function applyTransitions(host, request, clock = systemClock2) {
+  return applyBatch(host, request, { decode, write: walk }, clock);
+}
+function decode(payload) {
+  const { k, f, p } = payload;
+  if (typeof k !== "string" || typeof f !== "string" || !Array.isArray(p) || p.length === 0) {
+    return void 0;
+  }
+  if (!p.every((step) => typeof step === "string")) return void 0;
+  return { k, f, p };
+}
+async function walk(planned, issue, context) {
+  const { k: key, f: from, p: path } = planned;
+  const target = path[path.length - 1];
+  if (same(issue.status, target)) {
+    return { status: "applied", reason: `already ${issue.status ?? target}; nothing written` };
+  }
+  let start;
+  if (same(issue.status, from)) {
+    start = 0;
+  } else {
+    const at = path.findIndex((step) => same(step, issue.status));
+    if (at < 0) {
+      return {
+        status: "failed",
+        reason: `E_JIRA_MOVED: ${key} moved from ${from} to ${issue.status ?? "no status"} since the plan; run the cell again`
+      };
+    }
+    start = at + 1;
+  }
+  const walked = [];
+  const startedAt = issue.status ?? from;
+  const sofar = () => walked.length === 0 ? "" : `; walked ${[startedAt, ...walked].join(" \u2192 ")} before this`;
+  for (const step of path.slice(start)) {
+    const offered = await transitionsOf(context.client, key);
+    if (!offered.ok) return failedWith(offered.error, sofar());
+    const matches = offered.value.filter((transition) => same(transition.to, step));
+    const only = matches[0];
+    if (matches.length !== 1 || only === void 0) {
+      const at = issue.status ?? "its status";
+      const reason = matches.length === 0 ? `E_JIRA_TRANSITION: ${key} offers no transition from ${at} to ${step}; it offers ` + (offered.value.length === 0 ? "none" : offered.value.map(named).join(", ")) : `E_JIRA_TRANSITION: ${key} offers ${matches.length} transitions from ${at} to ${step}, ${matches.map(named).join(", ")}, and cannot tell which is meant`;
+      return { status: "failed", reason: `${reason}${sofar()}` };
+    }
+    const endpoint = transitionsPath(key);
+    const posted = await context.client.post(endpoint, { transition: { id: only.id } });
+    if (!posted.ok) return failedWith(posted.error, sofar());
+    issue.status = only.to;
+    walked.push(only.to);
+  }
+  const resumed = start === 0 ? "" : ` (resumed at ${startedAt})`;
+  return { status: "applied", reason: `walked ${[startedAt, ...walked].join(" \u2192 ")}${resumed}` };
+}
+function transitionsPath(key) {
+  return `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`;
+}
+async function transitionsOf(client, key) {
+  const path = transitionsPath(key);
+  const answer = await client.get(path);
+  if (!answer.ok) return answer;
+  const listed = record(answer.value)?.["transitions"];
+  if (!Array.isArray(listed)) {
+    return jiraError("E_JIRA_RESPONSE", `GET ${path} answered no transitions list.`);
+  }
+  const offered = [];
+  for (const each of listed) {
+    const transition = record(each);
+    const id = transition?.["id"];
+    const name = transition?.["name"];
+    const to = record(transition?.["to"])?.["name"];
+    if (typeof id !== "string" || typeof to !== "string") {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        `GET ${path} answered a transition without an id or a status.`
+      );
+    }
+    offered.push({ id, name: typeof name === "string" ? name : to, to });
+  }
+  return jiraOk(offered);
+}
+function named(transition) {
+  return `${transition.name} (to ${transition.to})`;
+}
+function problem2(text2) {
+  return argumentsProblem(text2, TRANSITION_VERB_ID);
+}
+
 // src/index.ts
 function activate(host) {
   const registered = [
     ...SETTINGS.map((setting) => host.registerConfiguration(setting)),
     host.registerRecipeVerb(pullVerb(host)),
-    host.registerRecipeVerb(refreshVerb(host))
+    host.registerRecipeVerb(refreshVerb(host)),
+    host.registerRecipeVerb(transitionVerb(host))
   ];
   return {
     dispose() {

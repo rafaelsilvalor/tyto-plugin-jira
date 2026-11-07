@@ -18,7 +18,13 @@ export type JiraErrorCode =
   /** The request never got an answer: Tyto refused it, or the network failed. */
   | 'E_JIRA_NETWORK'
   /** A 2xx whose body is not the JSON Jira promises. */
-  | 'E_JIRA_RESPONSE';
+  | 'E_JIRA_RESPONSE'
+  /** A planned write that cannot be applied as planned: no key, no value, too large to keep. */
+  | 'E_JIRA_PLAN'
+  /** The issue changed between the plan and Apply, so the write shown is no longer the one due. */
+  | 'E_JIRA_MOVED'
+  /** The issue offers no transition to the next status, or more than one. */
+  | 'E_JIRA_TRANSITION';
 
 export interface JiraError {
   readonly code: JiraErrorCode;
