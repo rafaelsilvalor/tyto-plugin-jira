@@ -1,7 +1,7 @@
 import type { PluginHost, RecipeVerbContribution } from '@tyto/plugin-api';
 
 import { readCache, recordingClient, replayingClient, writeCache, type PageCall } from './cache.js';
-import { FIXED_COLUMNS, FIXED_FIELDS, record, rowOf } from './columns.js';
+import { FIXED_COLUMNS, FIXED_FIELDS } from './columns.js';
 import { resolveJiraConfig } from './config.js';
 import { decodeCursor, encodeCursor, fingerprint, type PullCursor } from './cursor.js';
 import {
@@ -21,26 +21,18 @@ import {
   mappedColumns,
   mappedFields,
   mappedTypes,
-  mappedValues,
   sameColumns,
   type MappedTypes,
 } from './fields.js';
 import { createJiraClient, type JiraClient } from './http.js';
-import {
-  PAGE_SIZE,
-  commentBodies,
-  jqlOf,
-  parentDescriptions,
-  searchPage,
-  type SearchPage,
-  type Selector,
-} from './search.js';
+import { issueRow, readIssues, type IssuesRead } from './rows.js';
+import { PAGE_SIZE, jqlOf, searchPage, type SearchPage, type Selector } from './search.js';
 
 export const DEFAULT_MAX = 10_000;
 export const MAX_MAX = 100_000;
 
 const SELECTORS = ['jql', 'board', 'keys', 'parent'] as const;
-const ISSUE_KEY = /^[A-Z][A-Z0-9_]+-\d+$/;
+export const ISSUE_KEY = /^[A-Z][A-Z0-9_]+-\d+$/;
 
 const ARGUMENTS: readonly ArgumentSpec[] = [
   { name: 'jql', type: 'text' },
@@ -155,18 +147,14 @@ export async function pullPage(host: PullHost, request: PageRequest): Promise<Pa
 
   const rows: Row[] = [];
   for (const [index, issue] of read.page.issues.entries()) {
-    const parentKey = record(issue.fields['parent'])?.['key'];
-    const parent = typeof parentKey === 'string' ? read.parents.get(parentKey) : undefined;
-    const row = rowOf(issue, {
+    const row = issueRow(issue, read.comments[index] ?? [], read.parents, {
       baseUrl: config.value.baseUrl,
       fetchedAt,
-      commentBodies: read.comments[index] ?? [],
-      parentDescription: parent,
+      mapped: mapped.value,
+      types,
     });
     if (!row.ok) return failed(verbFailed(row.error));
-    const values = mappedValues(issue.fields, issue.key, mapped.value, types);
-    if (!values.ok) return failed(verbFailed(values.error));
-    rows.push({ ...row.value, values: { ...row.value.values, ...values.value } });
+    rows.push(row.value);
   }
 
   const table = { columns: [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types)], rows };
@@ -199,26 +187,17 @@ export async function pullPage(host: PullHost, request: PageRequest): Promise<Pa
 }
 
 /** What one page is made of, live or replayed from the cache. */
-interface PageRead {
+interface PageRead extends IssuesRead {
   readonly page: SearchPage;
-  readonly parents: ReadonlyMap<string, unknown>;
-  /** Each issue's comment bodies, in the page's order. */
-  readonly comments: readonly (readonly unknown[])[];
 }
 
 /** The search page and what its rows need, through whichever client is handed. */
 async function readPage(client: JiraClient, call: PageCall): Promise<JiraResult<PageRead>> {
   const page = await searchPage(client, call.jql, call.fields, call.token);
   if (!page.ok) return page;
-  const parents = await parentDescriptions(client, page.value.issues);
-  if (!parents.ok) return parents;
-  const comments: (readonly unknown[])[] = [];
-  for (const issue of page.value.issues) {
-    const bodies = await commentBodies(client, issue);
-    if (!bodies.ok) return bodies;
-    comments.push(bodies.value);
-  }
-  return { ok: true, value: { page: page.value, parents: parents.value, comments } };
+  const read = await readIssues(client, page.value.issues);
+  if (!read.ok) return read;
+  return { ok: true, value: { page: page.value, ...read.value } };
 }
 
 /** The selector and `max=`, or what is wrong with the step's arguments. */
