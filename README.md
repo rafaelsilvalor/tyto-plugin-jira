@@ -7,7 +7,8 @@ and unlicensed.
 
 ## Status
 
-**`jira.pull` works with its fifteen fixed columns; the rest is not written yet.** A recipe
+**`jira.pull` works, with its fifteen fixed columns, mapped fields and a page cache; the rest
+is not written yet.** A recipe
 step names exactly one of `jql=`, `board=`, `keys=` or `parent=`, and `max=` (10,000 unless
 written, at most 100,000):
 
@@ -21,9 +22,49 @@ It answers `key`, `url`, `project`, `issuetype`, `status`, `status_category`, `s
 saved filter; a Kanban board's sub-query is not applied. More issues than `max=` is an error,
 never a shorter table. Not yet working, each its own pull request:
 
-- columns mapped from Jira fields in the `jira` section's `fields:`, and a cache of the pages;
 - `jira.refresh`;
 - the user documentation and a check against a real site.
+
+## Mapped fields
+
+Any other Jira field becomes a column, after the fixed ones, when the `jira` section of
+`.tyto/project.json` maps a column name to the field's id:
+
+```json
+{
+  "jira": {
+    "baseUrl": "https://example.atlassian.net",
+    "fields": { "story_points": "customfield_10016", "team": "customfield_10020" }
+  }
+}
+```
+
+A column name is lower case letters, digits and `_`, starting with a letter, and is not one of
+the fifteen fixed columns. The id must be one the site has: the first page of a pull reads the
+site's field catalogue (`GET /rest/api/3/field`), and a name written where the id belongs is
+refused with the id it should have been. The catalogue's `schema.type` gives the column's type:
+
+| Jira type                               | Column     | Value                                       |
+| --------------------------------------- | ---------- | ------------------------------------------- |
+| `string`                                | `text`     | the text; a rich-text field's plain text    |
+| `number`                                | `number`   | the number                                  |
+| `date`                                  | `date`     | `2026-10-01`                                |
+| `datetime`                              | `datetime` | ISO 8601 in UTC                             |
+| `array`                                 | `list`     | each item as text, an empty list when unset |
+| `option`, `user`, `priority` and others | `text`     | its `value`, `name` or `displayName`        |
+
+A section edited between two pages of one pull is refused rather than stitched together.
+
+## The page cache
+
+Each page's raw Jira answers (the search, the comment pages and the parents) are kept in the
+plugin's private cache in Tyto, never in the workspace, so running a recipe again within ten
+minutes asks Jira nothing; a board's filter and the field catalogue are still read. An entry
+is used only for the same site, account, query, fields and page, and only when the first page
+of the run came from the same fill, so one table never mixes two reads of Jira. Rows from the
+cache carry the time the page was stored as their `fetchedAt`. Running again without cache
+reads Jira and refills it. **The cache never fails a pull:** when Tyto cannot read or store an
+entry, the plugin logs a warning and reads Jira.
 
 ## Install into Tyto
 

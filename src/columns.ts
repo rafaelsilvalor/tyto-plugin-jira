@@ -5,7 +5,7 @@ export const ORIGIN = 'jira';
 
 /**
  * The fifteen columns every `jira.pull` answers, in this order, whatever the selector. The
- * `fields:` section's mapped columns come after them (TYTO-386 PR 3b).
+ * `fields:` section's mapped columns come after them (`fields.ts`).
  */
 export const FIXED_COLUMNS: readonly Column[] = (
   [

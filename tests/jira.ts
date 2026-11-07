@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-import type { FetchedResponse, HostFetchInit } from '@tyto/plugin-api';
+import type { FetchedResponse, HostCapabilities, HostFetchInit } from '@tyto/plugin-api';
 import { testPlugin, type PluginHarness } from '@tyto/plugin-api/testing';
 
 import { response } from './host.js';
@@ -34,7 +34,11 @@ export interface FakeSite {
 
 export async function fakeSite(
   routes: readonly Route[],
-  options: { readonly section?: unknown } = {},
+  options: {
+    readonly section?: unknown;
+    /** A cache of the test's own, such as {@link memoryCache}'s; absent, the host has none. */
+    readonly capabilities?: Partial<HostCapabilities>;
+  } = {},
 ): Promise<FakeSite> {
   const calls: JiraCall[] = [];
   const loaded = await testPlugin({
@@ -43,6 +47,7 @@ export async function fakeSite(
     settings: { 'jira.baseUrl': SITE },
     secrets: { 'api-token': TOKEN, email: EMAIL },
     ...(options.section === undefined ? {} : { section: options.section }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
     async fetch(url: string, init: HostFetchInit) {
       const parsed = new URL(url);
       const call: JiraCall = {
@@ -149,4 +154,47 @@ export function page(
   isLast = next === undefined,
 ): Readonly<Record<string, unknown>> {
   return { issues, ...(next === undefined ? {} : { nextPageToken: next }), isLast };
+}
+
+/** A host cache in memory, dated by a clock the test moves. */
+export interface MemoryCache {
+  readonly capabilities: Partial<HostCapabilities>;
+  readonly entries: Map<string, { bytes: Uint8Array; storedAt: string }>;
+  /** What the host's clock says now; a test sets it. */
+  now: string;
+  /** The entry under a key, decoded. */
+  entry(key: string): Record<string, unknown>;
+}
+
+export function memoryCache(): MemoryCache {
+  const entries = new Map<string, { bytes: Uint8Array; storedAt: string }>();
+  const cache: MemoryCache = {
+    entries,
+    now: new Date().toISOString(),
+    capabilities: {
+      cacheGet: async (_plugin, key) => entries.get(key),
+      async cachePut(_plugin, key, bytes) {
+        entries.set(key, { bytes, storedAt: cache.now });
+        return { storedAt: cache.now };
+      },
+      cacheDelete: async (_plugin, key) => entries.delete(key),
+      cacheList: async (_plugin, prefix) =>
+        [...entries]
+          .filter(([key]) => key.startsWith(prefix))
+          .map(([key, { bytes, storedAt }]) => ({ key, storedAt, size: bytes.byteLength })),
+    },
+    entry(key) {
+      const stored = entries.get(key);
+      if (stored === undefined) throw new Error(`no cache entry ${key}`);
+      return JSON.parse(new TextDecoder().decode(stored.bytes)) as Record<string, unknown>;
+    },
+  };
+  return cache;
+}
+
+/** `jira.pull`'s `page`, called as the host's loop calls it, for what a recipe cannot say. */
+export function pullVerbOf(site: FakeSite) {
+  const verb = site.plugin.host.registry.recipeVerbs().find((each) => each.id === 'jira.pull');
+  if (verb?.page === undefined) throw new Error('jira.pull is not registered');
+  return verb.page;
 }
