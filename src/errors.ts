@@ -33,6 +33,11 @@ export interface JiraError {
   readonly status?: number;
   /** The host's own refusal code (`E_PERMISSION`, `E_PLUGIN_FETCH`, `E_CREDENTIAL_MISSING`). */
   readonly hostCode?: string;
+  /**
+   * The JSON of a 4xx or 5xx answer, unredacted, for a caller that reads Jira's own shape of
+   * it (the bulk create's element errors). Never shown as it is: redact what is taken from it.
+   */
+  readonly body?: unknown;
 }
 
 export type JiraResult<T> =
@@ -45,7 +50,7 @@ export function jiraOk<T>(value: T): JiraResult<T> {
 export function jiraError<T = never>(
   code: JiraErrorCode,
   message: string,
-  details: { readonly status?: number; readonly hostCode?: string } = {},
+  details: { readonly status?: number; readonly hostCode?: string; readonly body?: unknown } = {},
 ): JiraResult<T> {
   return { ok: false, error: { code, message, ...details } };
 }

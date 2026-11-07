@@ -64,6 +64,57 @@ export interface WriteVerb<Decoded extends { readonly k: string }> {
   ): Promise<AppliedBatchOperation>;
 }
 
+/** What every write of one `apply` call shares. */
+export interface WriteSession {
+  readonly config: JiraConfig;
+  /** A client that makes no request past the call's budget and waits no retry past it. */
+  readonly client: JiraClient;
+  /** The outcome with its reason shortened and the token taken out. */
+  finished(outcome: AppliedBatchOperation): AppliedBatchOperation;
+  /** Whether the call's budget ran out; once it has, it stays out. */
+  expired(): boolean;
+}
+
+/**
+ * The site and the credentials of an `apply` call, and a client that stops at the call's
+ * budget ({@link APPLY_BUDGET_MILLISECONDS}): a request it refuses for time was never sent.
+ */
+export async function openSession(
+  host: WriteHost,
+  request: ApplyRequest,
+  clock: WriteClock = systemClock,
+): Promise<JiraResult<WriteSession>> {
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return config;
+  const { token } = config.value;
+  const redact = (text: string): string =>
+    token === '' ? text : text.split(token).join('[redacted]');
+  const deadline = clock.now() + APPLY_BUDGET_MILLISECONDS;
+  let outOfTime = false;
+  const expired = (): boolean => {
+    if (clock.now() > deadline) outOfTime = true;
+    return outOfTime;
+  };
+  const client = createJiraClient({
+    config: config.value,
+    fetch: (url, init) =>
+      expired() ? Promise.reject(new Error(NOT_REACHED)) : host.fetch(url, init),
+    sleep: async (milliseconds) => {
+      if (clock.now() + milliseconds > deadline) outOfTime = true;
+      else await (clock.sleep ?? wait)(milliseconds);
+    },
+  });
+  return jiraOk({
+    config: config.value,
+    client,
+    expired,
+    finished: (outcome) =>
+      outcome.reason === undefined
+        ? outcome
+        : { ...outcome, reason: shortened(redact(outcome.reason)) },
+  });
+}
+
 /** Keys per drift search: a whole batch, so one search per call. */
 const DRIFT_FIELDS = ['status', 'assignee', 'updated'] as const;
 
@@ -84,31 +135,9 @@ export async function applyBatch<Decoded extends { readonly k: string }>(
   clock: WriteClock = systemClock,
 ): Promise<ApplyAnswer> {
   const { operations } = request;
-  const config = await resolveJiraConfig(host, request.section);
-  if (!config.ok) return answered(operations.map(() => failedWith(config.error)));
-  const redact = (text: string): string =>
-    config.value.token === '' ? text : text.split(config.value.token).join('[redacted]');
-  const finished = (outcome: AppliedBatchOperation): AppliedBatchOperation =>
-    outcome.reason === undefined
-      ? outcome
-      : { ...outcome, reason: shortened(redact(outcome.reason)) };
-
-  const deadline = clock.now() + APPLY_BUDGET_MILLISECONDS;
-  let outOfTime = false;
-  const client = createJiraClient({
-    config: config.value,
-    fetch: (url, init) => {
-      if (outOfTime || clock.now() > deadline) {
-        outOfTime = true;
-        return Promise.reject(new Error(NOT_REACHED));
-      }
-      return host.fetch(url, init);
-    },
-    sleep: async (milliseconds) => {
-      if (clock.now() + milliseconds > deadline) outOfTime = true;
-      else await (clock.sleep ?? wait)(milliseconds);
-    },
-  });
+  const session = await openSession(host, request, clock);
+  if (!session.ok) return answered(operations.map(() => failedWith(session.error)));
+  const { client, config, finished, expired } = session.value;
 
   const decoded = operations.map((operation) => decodeOperation(operation.payload, verb));
   const keys = [
@@ -119,7 +148,7 @@ export async function applyBatch<Decoded extends { readonly k: string }>(
   const extra = verb.fields?.(decoded.filter((each) => typeof each === 'object')) ?? [];
   const read = keys.length === 0 ? jiraOk(new Map()) : await currentIssues(client, keys, extra);
   const context: WriteContext | undefined = read.ok
-    ? { client, config: config.value, current: read.value }
+    ? { client, config, current: read.value }
     : undefined;
 
   let refused: string | undefined;
@@ -133,8 +162,7 @@ export async function applyBatch<Decoded extends { readonly k: string }>(
       outcomes.push(finished(failedWith(read.error)));
       continue;
     }
-    if (outOfTime || clock.now() > deadline) {
-      outOfTime = true;
+    if (expired()) {
       outcomes.push({ status: 'skipped', reason: NOT_REACHED });
       continue;
     }
@@ -225,7 +253,7 @@ export function failedWith(error: JiraError, suffix = ''): AppliedBatchOperation
   return { status: 'failed', reason: `${describeJiraError(error)}${suffix}` };
 }
 
-function answered(operations: readonly AppliedBatchOperation[]): ApplyAnswer {
+export function answered(operations: readonly AppliedBatchOperation[]): ApplyAnswer {
   return { ok: true, value: { operations }, diagnostics: [] };
 }
 

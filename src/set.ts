@@ -64,7 +64,7 @@ const BUILT_IN: Readonly<Record<string, CatalogueField['schema']>> = {
 };
 
 /** How a cell becomes the value Jira takes, by the field's `schema`. */
-type Kind =
+export type Kind =
   'text' | 'textarea' | 'number' | 'date' | 'option' | 'user' | 'priority' | 'labels' | 'options';
 
 const TEXTAREA = ':textarea';
@@ -91,7 +91,7 @@ export function setVerb(host: SetHost, clock: WriteClock = systemClock): RecipeV
   };
 }
 
-interface Target {
+export interface Target {
   readonly id: string;
   readonly name: string;
   readonly kind: Kind;
@@ -186,7 +186,7 @@ export async function planSets(
 }
 
 /** The `schema` of a field as the way its value is written, or `undefined` when it is not one. */
-function kindOf(schema: CatalogueField['schema']): Kind | undefined {
+export function kindOf(schema: CatalogueField['schema']): Kind | undefined {
   switch (schema.type) {
     case 'string':
       return schema.custom?.endsWith(TEXTAREA) === true ? 'textarea' : 'text';
@@ -206,7 +206,7 @@ function kindOf(schema: CatalogueField['schema']): Kind | undefined {
 }
 
 /** The value Jira takes for the cell, or why the cell cannot be written. */
-function converted(target: Target, cell: CellValue): { readonly v: JsonValue } | string {
+export function converted(target: Target, cell: CellValue): { readonly v: JsonValue } | string {
   const empty = projected(cell) === null;
   const text = Array.isArray(cell) ? cell.map(String).join(', ') : String(cell ?? '').trim();
   switch (target.kind) {
@@ -255,7 +255,7 @@ function converted(target: Target, cell: CellValue): { readonly v: JsonValue } |
 }
 
 /** A value as a description shows it: a user by account id, anything else as a cell. */
-function shown(value: unknown): string {
+export function shown(value: unknown): string {
   const accountId = record(value)?.['accountId'];
   const cell = projected(value);
   const text =

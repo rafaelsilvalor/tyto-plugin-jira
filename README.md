@@ -5,7 +5,7 @@ recipe. Tyto knows no provider (Tyto ADR 0011, ADR 0127): everything Jira-specif
 in its own repository, and reaches Tyto only through the plugin API. This repository is public
 and unlicensed.
 
-It adds six recipe verbs:
+It adds seven recipe verbs:
 
 - **`jira.pull`**, a source: the issues a JQL query, a board, a list of keys or a parent names,
   as a table.
@@ -14,9 +14,10 @@ It adds six recipe verbs:
 - **`jira.transition`**, **`jira.assign`**, **`jira.set`** and **`jira.comment`**, actions: they
   move each row's issue to a status, assign it to an account, set one of its fields, or comment
   on it.
+- **`jira.create`**, an action: it creates one issue per row.
 
-**Running an action writes nothing.** Its cell shows a plan, one line per issue, and Jira
-changes only when you apply it (Tyto ADR 0129, ADR 0170). Creating issues is not here yet.
+**Running an action writes nothing.** Its cell shows a plan, one line per row, and Jira
+changes only when you apply it (Tyto ADR 0129, ADR 0170).
 
 Every example below is invented: `example.atlassian.net`, project `EX`, issues `EX-1`, `EX-2`.
 
@@ -276,11 +277,43 @@ jira.comment body=<column>
 - **Applying twice comments once.** Before posting, Apply reads the issue's last 50 comments;
   one this account left with the same text is applied with nothing written.
 
+## `jira.create`
+
+An action: it creates one issue per row, in one project, of one issue type.
+
+```
+jira.create project=<key> type=<issue type> summary=<column> [description=<column>] [parent=<column>]
+```
+
+- `summary=` is the column of each issue's summary; an empty one, or one over 255 characters,
+  is a planned failure of its row. `description=` becomes a document as `jira.comment`'s text
+  does, up to 1,500 bytes. `parent=` holds the parent's issue key, such as `EX-1`.
+- Every other column of the table that the `fields` of the `jira` section maps is written too,
+  converted as `jira.set` converts it; an empty cell leaves the field out. A mapped column of a
+  type it cannot write refuses the step: drop the column before it. The plan reads only the
+  field catalogue, and only when the table holds a mapped column.
+- A row whose summary, description and mapped values need more than 2,048 bytes to be kept
+  with the plan is a planned failure of its row.
+- Apply creates up to 50 issues per request (`POST /rest/api/3/issue/bulk`). Each row answers
+  the key of the issue it created (`created EX-42`), or Jira's own words for why that one was
+  refused; the others are created.
+
+**Each issue keeps a label, `tyto-<16 hex digits>`, on purpose.** It is a fingerprint of the
+site, the project and the row's key, so the same row always makes the same label. Before
+creating, Apply searches for the labels of its batch, and a row whose label is found answers
+`already created EX-42` with nothing written: an Apply whose answer was lost, or one run twice,
+creates each issue once. Removing the label from an issue gives up that guard for its row.
+
+Jira's search index can lag a write by a few seconds. **Applying again right after a create
+may not find the label yet**, and create the issue a second time; wait a little before
+applying the same plan again.
+
 ## Applying a plan
 
 Tyto hands a plan back in batches of 100 operations. Each batch reads its issues in one search
-(`key in (...)`) and writes them in order for up to 20 s; **the operations past that are
-skipped**, and applying again after running the cell picks them up. After Jira refuses the
+(`key in (...)`; `labels in (...)` for `jira.create`) and writes them in order for up to 20 s;
+**the operations past that are skipped**, and applying again after running the cell picks them
+up. After Jira refuses the
 token, the rest of the batch fails with the same reason, asking nothing more. A failed
 operation's reason starts with the plugin's code, as below.
 
@@ -339,6 +372,9 @@ and reads Jira.
 | Kept per planned operation     | 2,048 bytes; a longer walk is a planned failure of its row  |
 | Comment per row                | 1,500 bytes of text; a longer one is a planned failure      |
 | Comments read before posting   | the issue's last 50                                         |
+| Issues per create request      | 50                                                          |
+| Summary of a created issue     | 255 characters; a longer one is a planned failure           |
+| Description of a created issue | 1,500 bytes of text; a longer one is a planned failure      |
 
 **Past a limit, a step is an error, never a partial table.** A refresh past its ceilings says
 so and asks you to narrow it with `only=`.
@@ -365,8 +401,8 @@ No message carries the API token, even when Jira echoes it.
 
 ## Checking against a real site
 
-`tests/live.test.ts` runs both verbs against a real Jira Cloud site, and only when three
-environment variables name one. Without them it is skipped, which is what CI does:
+`tests/live.test.ts` runs the reading verbs against a real Jira Cloud site, and only when
+three environment variables name one. Without them it is skipped, which is what CI does:
 
 ```sh
 JIRA_LIVE_BASE_URL=https://<site>.atlassian.net \
@@ -382,6 +418,26 @@ in through `/rest/api/3/myself`, takes the first 20 issues the query answers, pu
 shape of the answers (the columns, their types, non-empty keys, the provenance), never a value,
 and prints only counts. `pnpm test:live` builds first, because the verbs run from
 `dist/index.js`.
+
+**The writes run only when a fourth variable names a sandbox project**, one where a test issue
+may be created and left behind:
+
+```sh
+JIRA_LIVE_BASE_URL=https://<site>.atlassian.net \
+JIRA_LIVE_EMAIL=<email> \
+JIRA_LIVE_TOKEN=<api-token> \
+JIRA_LIVE_SANDBOX_PROJECT=<KEY> \
+JIRA_LIVE_SANDBOX_TYPE='<issue type>' \
+pnpm test:live
+```
+
+`JIRA_LIVE_SANDBOX_TYPE` is optional, `Task` when unset. The check creates one issue in that
+project with `jira.create`, waits up to 30 s for the search to find its label, prints how long
+that took, and applies the same plan again, which must create nothing. Then, on that issue
+alone, it sets the summary with `jira.set`, comments twice with `jira.comment` (the second
+writes nothing), assigns it to the token's account with `jira.assign to=me`, and takes one of
+the transitions it offers with `jira.transition`. Nothing else on the site is written; the
+issue stays in the project, labelled, for you to delete.
 
 ## Development
 
