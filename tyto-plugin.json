@@ -2,7 +2,7 @@
   "name": "jira",
   "version": "0.1.0",
   "engine": ">=0.14",
-  "contributes": ["configuration"],
+  "contributes": ["configuration", "recipe-verb"],
   "permissions": ["net:*.atlassian.net", "credentials:api-token", "credentials:email"],
   "namespace": "jira"
 }

@@ -7,11 +7,21 @@ and unlicensed.
 
 ## Status
 
-**It does nothing useful yet.** It has the manifest, two settings, the build, and the HTTP
-client with its configuration (`src/http.ts`, `src/config.ts`), which no verb calls yet. Not
-yet working, each its own pull request:
+**`jira.pull` works with its fifteen fixed columns; the rest is not written yet.** A recipe
+step names exactly one of `jql=`, `board=`, `keys=` or `parent=`, and `max=` (10,000 unless
+written, at most 100,000):
 
-- `jira.pull`, which pulls issues by JQL, board, keys or parent, page by page, into a table;
+```
+jira.pull jql="project = EX AND status != Done"
+```
+
+It answers `key`, `url`, `project`, `issuetype`, `status`, `status_category`, `summary`,
+`parent_key`, `assignee`, `labels`, `created`, `updated` (both ISO 8601 in UTC),
+`description_urls`, `comment_urls` and `parent_description_urls`. A board is pulled by its
+saved filter; a Kanban board's sub-query is not applied. More issues than `max=` is an error,
+never a shorter table. Not yet working, each its own pull request:
+
+- columns mapped from Jira fields in the `jira` section's `fields:`, and a cache of the pages;
 - `jira.refresh`;
 - the user documentation and a check against a real site.
 

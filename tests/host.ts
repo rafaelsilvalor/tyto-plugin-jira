@@ -13,8 +13,8 @@ import {
  * permission checks (`net:*.atlassian.net`, `credentials:<key>`) and the same `config` and
  * `credentials` the isolated host gives, over fakes for the network and the secrets.
  *
- * In process rather than through `testPlugin`, because no verb calls the client yet: the
- * harness can reach a plugin only through what it registered.
+ * In process rather than through `testPlugin`, so the configuration and the client are tested
+ * on their own; `jira.ts` drives `jira.pull` through `testPlugin`.
  */
 const manifest = JSON.parse(
   readFileSync(new URL('../tyto-plugin.json', import.meta.url), 'utf8'),
