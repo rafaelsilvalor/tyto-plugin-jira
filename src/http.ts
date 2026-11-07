@@ -25,6 +25,7 @@ export type JiraQuery = Readonly<Record<string, string | number | boolean>>;
 export interface JiraClient {
   get(path: string, query?: JiraQuery): Promise<JiraResult<unknown>>;
   post(path: string, body: unknown): Promise<JiraResult<unknown>>;
+  put(path: string, body: unknown): Promise<JiraResult<unknown>>;
   /** Whether the email and token work on this site, with a message a person can act on. */
   myself(): Promise<JiraResult<JiraAccount>>;
 }
@@ -63,7 +64,7 @@ export function createJiraClient(options: JiraClientOptions): JiraClient {
     );
 
   async function request(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PUT',
     path: string,
     query: JiraQuery | undefined,
     body: unknown,
@@ -117,6 +118,7 @@ export function createJiraClient(options: JiraClientOptions): JiraClient {
   return {
     get: (path, query) => request('GET', path, query, undefined),
     post: (path, body) => request('POST', path, undefined, body),
+    put: (path, body) => request('PUT', path, undefined, body),
     async myself() {
       const answer = await request('GET', '/rest/api/3/myself', undefined, undefined);
       if (!answer.ok) return answer;

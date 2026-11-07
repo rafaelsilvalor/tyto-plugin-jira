@@ -191,6 +191,8 @@ export function recordingClient(client: JiraClient): {
         if (answer.ok) kept(path, answer.value);
         return answer;
       },
+      // A page only reads: a write passes through, never recorded.
+      put: (path, body) => client.put(path, body),
       myself: () => client.myself(),
     },
     raw: () => ({ search, comments, parents }),
@@ -220,6 +222,7 @@ export function replayingClient(raw: RawPage): JiraClient {
   return {
     get: async (path: string, _query?: JiraQuery) => answer(path),
     post: async (path: string) => answer(path),
+    put: async (): Promise<JiraResult<never>> => missing(),
     myself: async (): Promise<JiraResult<JiraAccount>> => missing(),
   };
 }

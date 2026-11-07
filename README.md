@@ -5,15 +5,17 @@ recipe. Tyto knows no provider (Tyto ADR 0011, ADR 0127): everything Jira-specif
 in its own repository, and reaches Tyto only through the plugin API. This repository is public
 and unlicensed.
 
-It adds two recipe verbs:
+It adds three recipe verbs:
 
 - **`jira.pull`**, a source: the issues a JQL query, a board, a list of keys or a parent names,
   as a table.
 - **`jira.refresh`**, a transform: the table it is handed, with each row that names an issue
   filled with what Jira holds now.
+- **`jira.transition`**, an action: it moves each row's issue to a status.
 
-**It only reads.** Neither verb changes anything in Jira; the verbs that write (transitions,
-fields, assignees, comments, new issues) are not here yet.
+**Running an action writes nothing.** Its cell shows a plan, one line per issue, and Jira
+changes only when you apply it (Tyto ADR 0129, ADR 0170). Assigning, setting fields,
+commenting and creating issues are not here yet.
 
 Every example below is invented: `example.atlassian.net`, project `EX`, issues `EX-1`, `EX-2`.
 
@@ -82,8 +84,24 @@ A workspace says which site it works with, and which extra fields become columns
   `jira.baseUrl` setting.
 - `fields`: a column name for each Jira field id. See [Mapped fields](#mapped-fields).
 
-A `workflows` key, the transition graph a write verb walks, arrives with the verbs that write;
-today the section has these two.
+- `workflows`: the transition graphs `jira.transition` walks, by name. Each maps a status to
+  the statuses one transition reaches from it:
+
+```json
+{
+  "jira": {
+    "workflows": {
+      "delivery": {
+        "To Do": ["In Progress"],
+        "In Progress": ["Review"],
+        "Review": ["Done", "In Progress"]
+      }
+    }
+  }
+}
+```
+
+A team's own graph belongs in its workspace, never in this plugin.
 
 ## `jira.pull`
 
@@ -177,6 +195,32 @@ jira.refresh [by=<column>] [only=<boolean column>] [children=true]
   provenance is `{source: "jira.refresh", id: <key>, fetchedAt}`.
 - It always reads Jira; it uses no cache.
 
+## `jira.transition`
+
+An action: it moves each row's issue from the status in the table's `status` column to `to=`.
+
+```
+jira.transition to=<status> [workflow=<name>]
+```
+
+- With `workflow=`, it walks the shortest path through that workflow of the `workflows` key,
+  one transition per status. Without it, it takes one direct transition.
+- The plan reads nothing from Jira. A status the workflow cannot reach from the row's is a
+  failure planned for that row alone, naming the statuses the workflow does reach. A row
+  already at `to=` is left out of the plan.
+- At each step, Apply asks the issue which transitions it offers and takes the one that leads to
+  the next status (ignoring case). None, or more than one, fails the issue and names them.
+- Apply reads each issue first. **An issue that moved since the plan fails alone**; one already
+  at `to=` is applied with nothing written; one standing on its planned path resumes from there.
+
+## Applying a plan
+
+Tyto hands a plan back in batches of 100 operations. Each batch reads its issues in one search
+(`key in (...)`) and writes them in order for up to 20 s; **the operations past that are
+skipped**, and applying again after running the cell picks them up. After Jira refuses the
+token, the rest of the batch fails with the same reason, asking nothing more. A failed
+operation's reason starts with the plugin's code, as below.
+
 ## A worked recipe: what left the query
 
 A recipe that lists the issues waiting on review, and also the ones that were waiting at the
@@ -228,6 +272,8 @@ and reads Jira.
 | Time per `jira.refresh` step   | 25 s, under the host's 30 s for one call                    |
 | Retries on 429 and 503         | 3, waiting 1, 2 and 4 s, or Jira's `Retry-After` up to 30 s |
 | Cache entry                    | 32 MiB; a larger page is read live and not stored           |
+| Writes per apply call          | 100 operations, written for up to 20 s                      |
+| Kept per planned operation     | 2,048 bytes; a longer walk is a planned failure of its row  |
 
 **Past a limit, a step is an error, never a partial table.** A refresh past its ceilings says
 so and asks you to narrow it with `only=`.
@@ -238,14 +284,17 @@ A failure reaches the recipe as Tyto's `E_RECIPE_VERB`, its message starting wit
 the plugin's own code, such as `'jira.pull' failed: E_JIRA_AUTH: …`. Arguments that do not say
 what to read, or name a column the table lacks, are `E_RECIPE_ARGUMENTS`.
 
-| Code              | What happened                                                                                    | What to do                                                                                                       |
-| ----------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `E_JIRA_CONFIG`   | No site, token or email; a site that is not Jira Cloud; a `fields` entry the site does not have. | Set what the message names: the site, the credential, or the field id it suggests.                               |
-| `E_JIRA_AUTH`     | Jira refused the token (401) or the account (403).                                               | 401: create a token and store it again. 403: check the account may see the project, or sign in on the site once. |
-| `E_JIRA_REDIRECT` | Jira answered a redirect, which is never followed.                                               | Check the site is the Jira Cloud address itself.                                                                 |
-| `E_JIRA_HTTP`     | Any other failed answer, a 429 or 503 still failing after its retries included.                  | Read Jira's own words in the message, such as a JQL mistake. Try a 429 or 503 again later.                       |
-| `E_JIRA_NETWORK`  | No answer: Tyto refused the request, or the network failed.                                      | Check the connection. A refusal by Tyto names its own code, such as `E_PERMISSION`.                              |
-| `E_JIRA_RESPONSE` | Jira answered something that is not what its API promises.                                       | Run again; if it stays, report it with the message.                                                              |
+| Code                | What happened                                                                                    | What to do                                                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `E_JIRA_CONFIG`     | No site, token or email; a site that is not Jira Cloud; a `fields` entry the site does not have. | Set what the message names: the site, the credential, or the field id it suggests.                               |
+| `E_JIRA_AUTH`       | Jira refused the token (401) or the account (403).                                               | 401: create a token and store it again. 403: check the account may see the project, or sign in on the site once. |
+| `E_JIRA_REDIRECT`   | Jira answered a redirect, which is never followed.                                               | Check the site is the Jira Cloud address itself.                                                                 |
+| `E_JIRA_HTTP`       | Any other failed answer, a 429 or 503 still failing after its retries included.                  | Read Jira's own words in the message, such as a JQL mistake. Try a 429 or 503 again later.                       |
+| `E_JIRA_NETWORK`    | No answer: Tyto refused the request, or the network failed.                                      | Check the connection. A refusal by Tyto names its own code, such as `E_PERMISSION`.                              |
+| `E_JIRA_RESPONSE`   | Jira answered something that is not what its API promises.                                       | Run again; if it stays, report it with the message.                                                              |
+| `E_JIRA_PLAN`       | A planned write that cannot be applied: no issue key, no status, or too long.                    | Fix the row the reason names, run the cell, apply again.                                                         |
+| `E_JIRA_MOVED`      | The issue changed between the plan and Apply, or is gone.                                        | Run the cell again for a plan from where the issue stands now.                                                   |
+| `E_JIRA_TRANSITION` | The issue offers no transition to the next status, or more than one.                             | Check the workflow in the section against the transitions the reason names.                                      |
 
 No message carries the API token, even when Jira echoes it.
 

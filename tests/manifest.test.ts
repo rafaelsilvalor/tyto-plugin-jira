@@ -44,6 +44,17 @@ describe('tyto-plugin.json', () => {
     await plugin.close();
   });
 
+  it('declares only the kinds of write a verb of this version plans', async () => {
+    const plugin = await harness();
+    expect(plugin.manifest.writes).toEqual(['transition']);
+    const declared = plugin.host.registry
+      .recipeVerbs()
+      .flatMap((verb) => verb.writes ?? [])
+      .sort();
+    expect(declared).toEqual([...(plugin.manifest.writes ?? [])].sort());
+    await plugin.close();
+  });
+
   it('carries the version package.json carries', async () => {
     const packageJson = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
@@ -55,7 +66,7 @@ describe('tyto-plugin.json', () => {
 });
 
 describe('activate', () => {
-  it('declares two settings with no default, the jira.pull source and jira.refresh', async () => {
+  it('declares two settings with no default, two reading verbs and an action', async () => {
     const plugin = await harness();
     const declared = plugin.host.registry.configurations();
     expect(declared.map((setting) => setting.key)).toEqual(['jira.baseUrl', 'jira.email']);
@@ -84,6 +95,14 @@ describe('activate', () => {
           { name: 'children', type: 'boolean' },
         ],
       ],
+      [
+        'jira.transition',
+        'action',
+        [
+          { name: 'to', type: 'text', required: true },
+          { name: 'workflow', type: 'text' },
+        ],
+      ],
     ]);
     await plugin.close();
   });
@@ -99,7 +118,7 @@ describe('activate', () => {
     await refused.close();
   });
 
-  it('withdraws every setting and both verbs when disposed', () => {
+  it('withdraws every setting and every verb when disposed', () => {
     const host = createPluginHost();
     let registered: Disposable | undefined;
     const activated = host.tryActivate({
@@ -112,7 +131,7 @@ describe('activate', () => {
     });
     expect(activated.ok).toBe(true);
     expect(host.registry.configurations()).toHaveLength(2);
-    expect(host.registry.recipeVerbs()).toHaveLength(2);
+    expect(host.registry.recipeVerbs()).toHaveLength(3);
     registered?.dispose();
     expect(host.registry.configurations()).toEqual([]);
     expect(host.registry.recipeVerbs()).toEqual([]);
