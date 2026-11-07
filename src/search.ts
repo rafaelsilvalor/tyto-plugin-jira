@@ -156,23 +156,60 @@ export async function parentDescriptions(
     else missing.add(parent);
   }
   if (missing.size === 0) return jiraOk(descriptions);
-  const answer = await client.post('/rest/api/3/issue/bulkfetch', {
-    issueIdsOrKeys: [...missing],
-    fields: ['description'],
-  });
-  if (!answer.ok) return answer;
-  const fetched = record(answer.value)?.['issues'];
-  if (!Array.isArray(fetched)) {
-    return shapeError('POST /rest/api/3/issue/bulkfetch answered no issues list');
-  }
-  for (const issue of fetched) {
-    const checked = issueOf(issue);
-    if (checked !== undefined) descriptions.set(checked.key, checked.fields['description']);
-  }
+  const fetched = await bulkIssues(client, [...missing], ['description']);
+  if (!fetched.ok) return fetched;
+  for (const issue of fetched.value.issues)
+    descriptions.set(issue.key, issue.fields['description']);
   return jiraOk(descriptions);
 }
 
-function issueOf(value: unknown): PulledIssue | undefined {
+/** Keys or ids per `bulkfetch`: the most Jira takes in one request. */
+export const BULK_FETCH_SIZE = 100;
+const BULK_FETCH_PATH = '/rest/api/3/issue/bulkfetch';
+
+export interface BulkIssues {
+  readonly issues: readonly PulledIssue[];
+  /** What was asked for and named in `issueErrors`: deleted, or hidden from the account. */
+  readonly refused: ReadonlySet<string>;
+}
+
+/**
+ * The issues asked for, through `POST /rest/api/3/issue/bulkfetch`, {@link BULK_FETCH_SIZE} per
+ * request. An issue Jira will not show comes back in `issueErrors`, not as a failure.
+ */
+export async function bulkIssues(
+  client: JiraClient,
+  idsOrKeys: readonly string[],
+  fields: readonly string[],
+): Promise<JiraResult<BulkIssues>> {
+  const issues: PulledIssue[] = [];
+  const refused = new Set<string>();
+  for (let start = 0; start < idsOrKeys.length; start += BULK_FETCH_SIZE) {
+    const answer = await client.post(BULK_FETCH_PATH, {
+      issueIdsOrKeys: idsOrKeys.slice(start, start + BULK_FETCH_SIZE),
+      fields,
+    });
+    if (!answer.ok) return answer;
+    const body = record(answer.value);
+    const fetched = body?.['issues'];
+    if (!Array.isArray(fetched))
+      return shapeError(`POST ${BULK_FETCH_PATH} answered no issues list`);
+    for (const issue of fetched) {
+      const checked = issueOf(issue);
+      if (checked !== undefined) issues.push(checked);
+    }
+    const errors = body?.['issueErrors'];
+    for (const error of Array.isArray(errors) ? errors : []) {
+      const named = record(error)?.['issueIdsOrKeys'];
+      for (const key of Array.isArray(named) ? named : []) {
+        if (typeof key === 'string') refused.add(key);
+      }
+    }
+  }
+  return jiraOk({ issues, refused });
+}
+
+export function issueOf(value: unknown): PulledIssue | undefined {
   const issue = record(value);
   const fields = record(issue?.['fields']);
   const id = issue?.['id'];

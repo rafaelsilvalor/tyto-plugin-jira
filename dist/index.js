@@ -177,12 +177,12 @@ function createJiraClient(options) {
         );
       }
       if (RETRIED_STATUSES.has(response.status)) {
-        const wait = retryWait(response, retry);
-        if (retry < MAX_RETRIES && wait.milliseconds !== void 0) {
-          await sleep(wait.milliseconds);
+        const wait2 = retryWait(response, retry);
+        if (retry < MAX_RETRIES && wait2.milliseconds !== void 0) {
+          await sleep(wait2.milliseconds);
           continue;
         }
-        const why = wait.milliseconds === void 0 ? `Jira asked to wait ${wait.seconds} s, longer than the ${MAX_RETRY_AFTER_SECONDS} s this plugin waits` : `still so after ${MAX_RETRIES} retries`;
+        const why = wait2.milliseconds === void 0 ? `Jira asked to wait ${wait2.seconds} s, longer than the ${MAX_RETRY_AFTER_SECONDS} s this plugin waits` : `still so after ${MAX_RETRIES} retries`;
         return jiraError(
           "E_JIRA_HTTP",
           redact(`${label} answered ${statusOf(response)}: ${why}. Try again later.`),
@@ -627,18 +627,19 @@ function nonEmptyString(value) {
 
 // src/diagnostics.ts
 var VERB_ID = "jira.pull";
-function verbFailed(error) {
+var REFRESH_VERB_ID = "jira.refresh";
+function verbFailed(error, verb = VERB_ID) {
   return {
     severity: "error",
     code: "E_RECIPE_VERB",
-    message: `'${VERB_ID}' failed: ${withoutFinalStop(describeJiraError(error))}.`
+    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
   };
 }
-function argumentsProblem(problem) {
+function argumentsProblem(problem2, verb = VERB_ID) {
   return {
     severity: "error",
     code: "E_RECIPE_ARGUMENTS",
-    message: `'${VERB_ID}' ${withoutFinalStop(problem)}.`
+    message: `'${verb}' ${withoutFinalStop(problem2)}.`
   };
 }
 function failed(diagnostic) {
@@ -900,20 +901,40 @@ async function parentDescriptions(client, issues) {
     else missing.add(parent);
   }
   if (missing.size === 0) return jiraOk(descriptions);
-  const answer = await client.post("/rest/api/3/issue/bulkfetch", {
-    issueIdsOrKeys: [...missing],
-    fields: ["description"]
-  });
-  if (!answer.ok) return answer;
-  const fetched = record(answer.value)?.["issues"];
-  if (!Array.isArray(fetched)) {
-    return shapeError("POST /rest/api/3/issue/bulkfetch answered no issues list");
-  }
-  for (const issue of fetched) {
-    const checked = issueOf(issue);
-    if (checked !== void 0) descriptions.set(checked.key, checked.fields["description"]);
-  }
+  const fetched = await bulkIssues(client, [...missing], ["description"]);
+  if (!fetched.ok) return fetched;
+  for (const issue of fetched.value.issues)
+    descriptions.set(issue.key, issue.fields["description"]);
   return jiraOk(descriptions);
+}
+var BULK_FETCH_SIZE = 100;
+var BULK_FETCH_PATH = "/rest/api/3/issue/bulkfetch";
+async function bulkIssues(client, idsOrKeys, fields) {
+  const issues = [];
+  const refused2 = /* @__PURE__ */ new Set();
+  for (let start = 0; start < idsOrKeys.length; start += BULK_FETCH_SIZE) {
+    const answer = await client.post(BULK_FETCH_PATH, {
+      issueIdsOrKeys: idsOrKeys.slice(start, start + BULK_FETCH_SIZE),
+      fields
+    });
+    if (!answer.ok) return answer;
+    const body = record(answer.value);
+    const fetched = body?.["issues"];
+    if (!Array.isArray(fetched))
+      return shapeError(`POST ${BULK_FETCH_PATH} answered no issues list`);
+    for (const issue of fetched) {
+      const checked = issueOf(issue);
+      if (checked !== void 0) issues.push(checked);
+    }
+    const errors = body?.["issueErrors"];
+    for (const error of Array.isArray(errors) ? errors : []) {
+      const named = record(error)?.["issueIdsOrKeys"];
+      for (const key of Array.isArray(named) ? named : []) {
+        if (typeof key === "string") refused2.add(key);
+      }
+    }
+  }
+  return jiraOk({ issues, refused: refused2 });
 }
 function issueOf(value) {
   const issue = record(value);
@@ -927,6 +948,32 @@ function issueOf(value) {
 }
 function shapeError(message) {
   return jiraError("E_JIRA_RESPONSE", `${message}.`);
+}
+
+// src/rows.ts
+async function readIssues(client, issues) {
+  const parents = await parentDescriptions(client, issues);
+  if (!parents.ok) return parents;
+  const comments = [];
+  for (const issue of issues) {
+    const bodies = await commentBodies(client, issue);
+    if (!bodies.ok) return bodies;
+    comments.push(bodies.value);
+  }
+  return jiraOk({ parents: parents.value, comments });
+}
+function issueRow(issue, comments, parents, context) {
+  const parentKey = record(issue.fields["parent"])?.["key"];
+  const row = rowOf(issue, {
+    baseUrl: context.baseUrl,
+    fetchedAt: context.fetchedAt,
+    commentBodies: comments,
+    parentDescription: typeof parentKey === "string" ? parents.get(parentKey) : void 0
+  });
+  if (!row.ok) return row;
+  const values = mappedValues(issue.fields, issue.key, context.mapped, context.types);
+  if (!values.ok) return values;
+  return jiraOk({ ...row.value, values: { ...row.value.values, ...values.value } });
 }
 
 // src/pull.ts
@@ -1025,18 +1072,14 @@ async function pullPage(host, request) {
   }
   const rows = [];
   for (const [index, issue] of read.page.issues.entries()) {
-    const parentKey = record(issue.fields["parent"])?.["key"];
-    const parent = typeof parentKey === "string" ? read.parents.get(parentKey) : void 0;
-    const row = rowOf(issue, {
+    const row = issueRow(issue, read.comments[index] ?? [], read.parents, {
       baseUrl: config.value.baseUrl,
       fetchedAt,
-      commentBodies: read.comments[index] ?? [],
-      parentDescription: parent
+      mapped: mapped.value,
+      types
     });
     if (!row.ok) return failed(verbFailed(row.error));
-    const values = mappedValues(issue.fields, issue.key, mapped.value, types);
-    if (!values.ok) return failed(verbFailed(values.error));
-    rows.push({ ...row.value, values: { ...row.value.values, ...values.value } });
+    rows.push(row.value);
   }
   const table = { columns: [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types)], rows };
   const { isLast, nextPageToken } = read.page;
@@ -1062,15 +1105,9 @@ async function pullPage(host, request) {
 async function readPage(client, call) {
   const page = await searchPage(client, call.jql, call.fields, call.token);
   if (!page.ok) return page;
-  const parents = await parentDescriptions(client, page.value.issues);
-  if (!parents.ok) return parents;
-  const comments = [];
-  for (const issue of page.value.issues) {
-    const bodies = await commentBodies(client, issue);
-    if (!bodies.ok) return bodies;
-    comments.push(bodies.value);
-  }
-  return { ok: true, value: { page: page.value, parents: parents.value, comments } };
+  const read = await readIssues(client, page.value.issues);
+  if (!read.ok) return read;
+  return { ok: true, value: { page: page.value, ...read.value } };
 }
 function readRequest(values) {
   const given = SELECTORS.filter((name) => values[name] !== void 0);
@@ -1111,6 +1148,267 @@ function selectorOf(name, values) {
   return { kind: "keys", keys: [...new Set(keys)] };
 }
 
+// src/refresh.ts
+var MAX_KEYS = 1e3;
+var MAX_CHILDREN = 5e3;
+var BUDGET_MILLISECONDS = 25e3;
+var PARENTS_PER_SEARCH = 100;
+var ARGUMENTS2 = [
+  { name: "by", type: "text" },
+  { name: "only", type: "text" },
+  { name: "children", type: "boolean" }
+];
+var systemClock = { now: () => Date.now() };
+function refreshVerb(host, clock = systemClock) {
+  return {
+    id: REFRESH_VERB_ID,
+    kind: "transform",
+    arguments: ARGUMENTS2,
+    transform: (request) => refreshTable(host, request, clock)
+  };
+}
+async function refreshTable(host, request, clock = systemClock) {
+  const { table } = request;
+  const asked = readArguments(request);
+  if ("severity" in asked) return refused(asked);
+  const { by, only, children } = asked;
+  const mapped = mappedFields(request.section);
+  if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
+  const jiraNames = /* @__PURE__ */ new Set([
+    ...FIXED_COLUMNS.map((column) => column.name),
+    ...mapped.value.map(({ column }) => column)
+  ]);
+  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
+    return refused(
+      problem(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
+    );
+  }
+  const keyOf = (row) => {
+    const value = by === void 0 ? row.key : row.values[by.name];
+    const key = typeof value === "string" ? value.trim() : void 0;
+    return key !== void 0 && ISSUE_KEY.test(key) ? key : void 0;
+  };
+  const keys = [
+    ...new Set(
+      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
+    )
+  ];
+  if (keys.length > MAX_KEYS) {
+    return refused(
+      narrow(
+        `would refresh ${issueCount(keys.length)}, more than the ${count(MAX_KEYS)} one call takes`
+      )
+    );
+  }
+  const config = await resolveJiraConfig(host, request.section);
+  if (!config.ok) return refused(verbFailed(config.error, REFRESH_VERB_ID));
+  const deadline = clock.now() + BUDGET_MILLISECONDS;
+  let overBudget = false;
+  const client = createJiraClient({
+    config: config.value,
+    fetch: (url, init) => {
+      if (clock.now() > deadline) {
+        overBudget = true;
+        return Promise.reject(new Error("the refresh ran out of time"));
+      }
+      return host.fetch(url, init);
+    },
+    sleep: async (milliseconds) => {
+      if (clock.now() + milliseconds > deadline) overBudget = true;
+      else await (clock.sleep ?? wait)(milliseconds);
+    }
+  });
+  const jiraFailed = (error) => overBudget ? refused(
+    narrow(
+      `did not finish ${issueCount(keys.length)} within ${BUDGET_MILLISECONDS / 1e3} s`
+    )
+  ) : refused(verbFailed(error, REFRESH_VERB_ID));
+  const types = await mappedTypes(client, mapped.value);
+  if (!types.ok) return jiraFailed(types.error);
+  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
+  const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
+  for (const target of targets) {
+    const column = existing.get(target.name);
+    if (column !== void 0 && column.type !== target.type) {
+      return refused(
+        problem(
+          `would write ${target.type} column ${target.name}, and the table's ${column.name} is ${column.type}; rename it before this step`
+        )
+      );
+    }
+  }
+  const fields = [.../* @__PURE__ */ new Set([...FIXED_FIELDS, ...mapped.value.map(({ id }) => id)])];
+  const found = await fetchIssues(client, keys, fields);
+  if (!found.ok) return jiraFailed(found.error);
+  const issues = /* @__PURE__ */ new Map();
+  for (const issue of found.value.values()) issues.set(issue.key, issue);
+  if (children) {
+    const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
+    const read2 = await childrenOf(client, parents, fields);
+    if (!read2.ok) return jiraFailed(read2.error);
+    if (read2.value === "too many") {
+      return refused(
+        narrow(`found more than ${count(MAX_CHILDREN)} children of ${issueCount(parents.length)}`)
+      );
+    }
+    for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
+  }
+  const ordered = [...issues.values()];
+  const read = await readIssues(client, ordered);
+  if (!read.ok) return jiraFailed(read.error);
+  const fetchedAt = new Date(clock.now()).toISOString();
+  const nameOf = (name) => existing.get(name)?.name ?? name;
+  const live = /* @__PURE__ */ new Map();
+  for (const [index, issue] of ordered.entries()) {
+    const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
+      baseUrl: config.value.baseUrl,
+      fetchedAt,
+      mapped: mapped.value,
+      types: types.value
+    });
+    if (!row.ok) return jiraFailed(row.error);
+    const values = {};
+    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
+    live.set(issue.key, {
+      key: issue.key,
+      values,
+      provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
+    });
+  }
+  const added = targets.filter((target) => !existing.has(target.name));
+  const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
+  const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
+  const askedKeys = new Set(keys);
+  const rowKeys = new Set(table.rows.map((row) => row.key));
+  const present = /* @__PURE__ */ new Set();
+  const rows = table.rows.map((row) => {
+    const key = keyOf(row);
+    if (key === void 0) return { ...row, values: { ...addedNulls, ...row.values } };
+    const issue = found.value.get(key) ?? issues.get(key);
+    const fresh = issue === void 0 ? void 0 : live.get(issue.key);
+    if (fresh !== void 0) {
+      present.add(fresh.key);
+      return { ...row, values: { ...row.values, ...fresh.values }, provenance: fresh.provenance };
+    }
+    if (!askedKeys.has(key)) return { ...row, values: { ...addedNulls, ...row.values } };
+    const values = { ...row.values, ...jiraNulls };
+    if (by !== void 0) values[by.name] = row.values[by.name] ?? null;
+    return { ...row, values };
+  });
+  const emptyRow = Object.fromEntries(
+    [...table.columns.map((column) => column.name), ...added.map((column) => column.name)].map(
+      (name) => [name, null]
+    )
+  );
+  for (const [key, fresh] of live) {
+    if (present.has(key)) continue;
+    if (rowKeys.has(key)) {
+      return refused(
+        problem(
+          `would add child ${key}, which is already the key of a row with another ${by?.name ?? "key"}; two rows cannot share a key`
+        )
+      );
+    }
+    const values = { ...emptyRow, ...fresh.values };
+    if (by !== void 0) values[by.name] = key;
+    rows.push({ ...fresh, values });
+  }
+  return { ok: true, value: { columns: [...table.columns, ...added], rows }, diagnostics: [] };
+}
+function readArguments(request) {
+  const columns = new Map(
+    request.table.columns.map((column) => [column.name.toLowerCase(), column])
+  );
+  const columnOf = (name) => {
+    const written = request.arguments[name];
+    if (written === void 0) return void 0;
+    const column = columns.get(String(written).trim().toLowerCase());
+    return column ?? problem(`${name}= names '${String(written)}', which is not a column of the table`);
+  };
+  const by = columnOf("by");
+  if (by !== void 0 && "severity" in by) return by;
+  if (by !== void 0 && by.type !== "text") {
+    return problem(`by= names ${by.name}, a ${by.type} column; an issue key is text`);
+  }
+  const only = columnOf("only");
+  if (only !== void 0 && "severity" in only) return only;
+  if (only !== void 0 && only.type !== "boolean") {
+    return problem(
+      `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
+    );
+  }
+  return { by, only, children: request.arguments["children"] === true };
+}
+async function fetchIssues(client, keys, fields) {
+  const answered = await bulkIssues(client, keys, fields);
+  if (!answered.ok) return answered;
+  const byKey = new Map(answered.value.issues.map((issue) => [issue.key, issue]));
+  const found = /* @__PURE__ */ new Map();
+  for (const key of keys) {
+    const issue = byKey.get(key);
+    if (issue !== void 0) {
+      found.set(key, issue);
+      continue;
+    }
+    if (answered.value.refused.has(key)) continue;
+    const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const single = await client.get(path, { fields: fields.join(",") });
+    if (!single.ok) {
+      if (single.error.status === 404) continue;
+      return single;
+    }
+    const moved = issueOf(single.value);
+    if (moved === void 0) {
+      return jiraError(
+        "E_JIRA_RESPONSE",
+        `GET ${path} answered an issue without an id, a key or fields.`
+      );
+    }
+    found.set(key, moved);
+  }
+  return jiraOk(found);
+}
+async function childrenOf(client, parents, fields) {
+  const children = [];
+  for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
+    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
+    let token;
+    for (; ; ) {
+      const page = await searchPage(client, jql, fields, token);
+      if (!page.ok) return page;
+      children.push(...page.value.issues);
+      if (children.length > MAX_CHILDREN) return jiraOk("too many");
+      const next = page.value.nextPageToken;
+      if (page.value.isLast || next === void 0) break;
+      if (next === token) {
+        return jiraError("E_JIRA_RESPONSE", "the children search answered the token it was given.");
+      }
+      token = next;
+    }
+  }
+  return jiraOk(children);
+}
+function problem(text2) {
+  return argumentsProblem(text2, REFRESH_VERB_ID);
+}
+function narrow(what) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_VERB",
+    message: `'${REFRESH_VERB_ID}' ${what}; narrow it with only=.`
+  };
+}
+function refused(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function issueCount(value) {
+  return `${count(value)} ${value === 1 ? "issue" : "issues"}`;
+}
+function count(value) {
+  return value.toLocaleString("en-US");
+}
+var wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
 // src/settings.ts
 var SETTINGS = [
   {
@@ -1131,7 +1429,8 @@ var SETTINGS = [
 function activate(host) {
   const registered = [
     ...SETTINGS.map((setting) => host.registerConfiguration(setting)),
-    host.registerRecipeVerb(pullVerb(host))
+    host.registerRecipeVerb(pullVerb(host)),
+    host.registerRecipeVerb(refreshVerb(host))
   ];
   return {
     dispose() {

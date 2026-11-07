@@ -55,7 +55,7 @@ describe('tyto-plugin.json', () => {
 });
 
 describe('activate', () => {
-  it('declares two settings with no default, and the jira.pull source', async () => {
+  it('declares two settings with no default, the jira.pull source and jira.refresh', async () => {
     const plugin = await harness();
     const declared = plugin.host.registry.configurations();
     expect(declared.map((setting) => setting.key)).toEqual(['jira.baseUrl', 'jira.email']);
@@ -75,6 +75,15 @@ describe('activate', () => {
           { name: 'max', type: 'number' },
         ],
       ],
+      [
+        'jira.refresh',
+        'transform',
+        [
+          { name: 'by', type: 'text' },
+          { name: 'only', type: 'text' },
+          { name: 'children', type: 'boolean' },
+        ],
+      ],
     ]);
     await plugin.close();
   });
@@ -90,7 +99,7 @@ describe('activate', () => {
     await refused.close();
   });
 
-  it('withdraws every setting and the verb when disposed', () => {
+  it('withdraws every setting and both verbs when disposed', () => {
     const host = createPluginHost();
     let registered: Disposable | undefined;
     const activated = host.tryActivate({
@@ -103,7 +112,7 @@ describe('activate', () => {
     });
     expect(activated.ok).toBe(true);
     expect(host.registry.configurations()).toHaveLength(2);
-    expect(host.registry.recipeVerbs()).toHaveLength(1);
+    expect(host.registry.recipeVerbs()).toHaveLength(2);
     registered?.dispose();
     expect(host.registry.configurations()).toEqual([]);
     expect(host.registry.recipeVerbs()).toEqual([]);

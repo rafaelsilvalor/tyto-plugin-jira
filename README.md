@@ -7,8 +7,8 @@ and unlicensed.
 
 ## Status
 
-**`jira.pull` works, with its fifteen fixed columns, mapped fields and a page cache; the rest
-is not written yet.** A recipe
+**`jira.pull` works, with its fifteen fixed columns, mapped fields and a page cache, and so
+does `jira.refresh`.** A recipe
 step names exactly one of `jql=`, `board=`, `keys=` or `parent=`, and `max=` (10,000 unless
 written, at most 100,000):
 
@@ -20,10 +20,23 @@ It answers `key`, `url`, `project`, `issuetype`, `status`, `status_category`, `s
 `parent_key`, `assignee`, `labels`, `created`, `updated` (both ISO 8601 in UTC),
 `description_urls`, `comment_urls` and `parent_description_urls`. A board is pulled by its
 saved filter; a Kanban board's sub-query is not applied. More issues than `max=` is an error,
-never a shorter table. Not yet working, each its own pull request:
+never a shorter table.
 
-- `jira.refresh`;
-- the user documentation and a check against a real site.
+`jira.refresh [by=<column>] [only=<boolean column>] [children=true]` fills the table it is
+handed with what Jira holds now, in the same columns, so a row `recall` brought back gets its
+current values:
+
+```
+recall waiting mark=recalled
+jira.refresh only=recalled children=true
+```
+
+It reads the issue key from the row's key, or from `by=`; `only=` limits it to the rows where
+that column is true; `children=true` adds every child of the refreshed issues. A deleted issue
+keeps its row with empty Jira columns, and a moved one keeps its row key. One call refreshes
+at most 1,000 issues and 5,000 children within 25 s, and past any of them answers an error,
+never a partial table. It always reads Jira; it uses no cache. Not yet working: the user
+documentation and a check against a real site.
 
 ## Mapped fields
 

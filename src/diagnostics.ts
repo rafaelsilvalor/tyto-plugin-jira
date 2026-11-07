@@ -19,26 +19,27 @@ export type ArgumentSpec = RecipeVerbContribution['arguments'][number];
 export type ArgumentValues = PageRequest['arguments'];
 
 export const VERB_ID = 'jira.pull';
+export const REFRESH_VERB_ID = 'jira.refresh';
 
 /**
  * A Jira failure in Tyto's words. Tyto's catalogue is closed, so the plugin's own code
  * (`E_JIRA_AUTH`, `E_JIRA_CONFIG`…) rides inside `E_RECIPE_VERB`'s message, first, where a bug
  * report carries it.
  */
-export function verbFailed(error: JiraError): Diagnostic {
+export function verbFailed(error: JiraError, verb: string = VERB_ID): Diagnostic {
   return {
     severity: 'error',
     code: 'E_RECIPE_VERB',
-    message: `'${VERB_ID}' failed: ${withoutFinalStop(describeJiraError(error))}.`,
+    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`,
   };
 }
 
-/** The step's arguments are of the right types but do not say one thing to pull. */
-export function argumentsProblem(problem: string): Diagnostic {
+/** The step's arguments are of the right types but do not say what to read. */
+export function argumentsProblem(problem: string, verb: string = VERB_ID): Diagnostic {
   return {
     severity: 'error',
     code: 'E_RECIPE_ARGUMENTS',
-    message: `'${VERB_ID}' ${withoutFinalStop(problem)}.`,
+    message: `'${verb}' ${withoutFinalStop(problem)}.`,
   };
 }
 
