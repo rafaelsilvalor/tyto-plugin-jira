@@ -114,6 +114,8 @@ describe('activate', () => {
         [
           { name: 'field', type: 'text', required: true },
           { name: 'value', type: 'text', required: true },
+          { name: 'only', type: 'text' },
+          { name: 'from-column', type: 'text' },
         ],
       ],
       ['jira.comment', 'action', [{ name: 'body', type: 'text', required: true }]],

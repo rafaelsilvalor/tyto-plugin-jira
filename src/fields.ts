@@ -1,5 +1,5 @@
 import { FIXED_COLUMNS, ORIGIN, isoUtc, record } from './columns.js';
-import type { CellValue, Column } from './diagnostics.js';
+import type { CellValue, Column, Row } from './diagnostics.js';
 import { jiraError, jiraOk, type JiraResult } from './errors.js';
 import type { JiraClient } from './http.js';
 
@@ -246,6 +246,18 @@ export function projected(value: unknown): CellValue {
   }
   if (typeof value === 'number') return value;
   return textOf(value);
+}
+
+/**
+ * Whether `only=<column>` keeps a row: the true cell of a boolean column, or a cell of any other
+ * column that holds something, such as the `<column>_push` that Tyto's `decide` leaves empty on
+ * every row it does not push.
+ */
+export function chosenBy(row: Row, column: Column): boolean {
+  const cell = row.values[column.name] ?? null;
+  if (column.type === 'boolean') return cell === true;
+  const shown = projected(cell);
+  return shown !== null && (typeof shown !== 'string' || shown.trim() !== '');
 }
 
 function configError<T>(message: string): JiraResult<T> {

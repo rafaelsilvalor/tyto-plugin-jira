@@ -13,7 +13,7 @@ import {
   type Row,
 } from './diagnostics.js';
 import { jiraError, jiraOk, type JiraError, type JiraResult } from './errors.js';
-import { mappedColumns, mappedFields, mappedTypes } from './fields.js';
+import { chosenBy, mappedColumns, mappedFields, mappedTypes } from './fields.js';
 import { createJiraClient, type JiraClient } from './http.js';
 import { ISSUE_KEY } from './pull.js';
 import { issueRow, readIssues } from './rows.js';
@@ -109,7 +109,7 @@ export async function refreshTable(
   const keys = [
     ...new Set(
       table.rows
-        .filter((row) => only === undefined || row.values[only.name] === true)
+        .filter((row) => only === undefined || chosenBy(row, only))
         .map(keyOf)
         .filter((key): key is string => key !== undefined),
     ),

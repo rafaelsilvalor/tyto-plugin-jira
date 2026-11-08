@@ -259,7 +259,7 @@ jira.assign to=<column>|me|none
 An action: it sets one field of each row's issue to the row's cell.
 
 ```
-jira.set field=<field> value=<column>
+jira.set field=<field> value=<column> [only=<column>] [from-column=<column>]
 ```
 
 - `field=` is a column the `fields` of the `jira` section maps, or one of `summary`, `labels`,
@@ -287,6 +287,31 @@ jira.set field=<field> value=<column>
   `labels`, or a mapped column), Apply checks Jira still holds what that column read, and fails
   an issue whose field changed since the plan. An issue that already holds the value is applied
   with nothing written.
+- **`only=` plans nothing for the rows it leaves out**: it keeps a row whose cell in that column
+  is true (a boolean column) or holds something (any other column), as `jira.refresh` keeps
+  its rows. The rows it keeps plan as without it: an empty value cell still clears the field,
+  and a cell the field cannot take still fails that row alone.
+- `from-column=` names the column the drift check reads instead of the one named like
+  `field=`: after `jira.refresh prefix=jira_`, the column named like the field is the sheet's
+  own, and Jira's is `jira_<field>`.
+- `only=` and `from-column=` naming a column the table lacks are refused before a plan.
+- `only=` is how a recipe writes a shared field back only on the rows a step before it chose.
+  Tyto's `decide` writes `<column>_push`, the decided value on a push row and empty on every
+  other. With `{"team": "customfield_10020"}` in the `fields` of the `jira` section:
+
+  ```
+  google.sheet-rows tab=Tasks
+  jira.refresh by=key prefix=jira_
+  last sync columns=team
+  decide team local=team remote=jira_team last=last_team hold-when-empty=jira_status
+  remember sync columns=team when="team_action != hold"
+  jira.set field=team value=team_push only=team_push from-column=jira_team
+  select key team
+  google.sheet-sync key=key tab=Tasks
+  ```
+
+  The write comes before `select` and the sync, because each step reads only the table the
+  step before it answered.
 
 ## `jira.comment`
 
