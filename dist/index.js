@@ -2265,8 +2265,10 @@ var PARENTS_PER_SEARCH = 100;
 var ARGUMENTS6 = [
   { name: "by", type: "text" },
   { name: "only", type: "text" },
-  { name: "children", type: "boolean" }
+  { name: "children", type: "boolean" },
+  { name: "prefix", type: "text" }
 ];
+var PREFIX = /^[A-Za-z][A-Za-z0-9_]*$/;
 var systemClock2 = { now: () => Date.now() };
 function refreshVerb(host, clock = systemClock2) {
   return {
@@ -2280,16 +2282,23 @@ async function refreshTable(host, request, clock = systemClock2) {
   const { table } = request;
   const asked = readArguments(request);
   if ("severity" in asked) return refused(asked);
-  const { by, only, children } = asked;
+  const { by, only, children, prefix } = asked;
   const mapped = mappedFields(request.section);
   if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
-  const jiraNames = /* @__PURE__ */ new Set([
-    ...FIXED_COLUMNS.map((column) => column.name),
-    ...mapped.value.map(({ column }) => column)
-  ]);
-  if (by !== void 0 && by.name !== "key" && jiraNames.has(by.name.toLowerCase())) {
+  const written = (name) => `${prefix}${name}`;
+  const jiraNames = new Set(
+    [
+      ...FIXED_COLUMNS.map((column) => column.name),
+      ...mapped.value.map(({ column }) => column)
+    ].map((name) => written(name).toLowerCase())
+  );
+  const writtenKey = written("key").toLowerCase();
+  const byName = by?.name.toLowerCase();
+  if (byName !== void 0 && byName !== writtenKey && jiraNames.has(byName)) {
     return refused(
-      problem5(`by= names ${by.name}, a column this verb writes; name key or a column of your own`)
+      problem5(
+        `by= names ${by?.name ?? byName}, a column this verb writes; name key or a column of your own`
+      )
     );
   }
   const keyOf = (row) => {
@@ -2334,10 +2343,13 @@ async function refreshTable(host, request, clock = systemClock2) {
   ) : refused(verbFailed(error, REFRESH_VERB_ID));
   const types = await mappedTypes(client, mapped.value);
   if (!types.ok) return jiraFailed(types.error);
-  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
+  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)].map((column) => ({
+    ...column,
+    name: written(column.name)
+  }));
   const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
   for (const target of targets) {
-    const column = existing.get(target.name);
+    const column = existing.get(target.name.toLowerCase());
     if (column !== void 0 && column.type !== target.type) {
       return refused(
         problem5(
@@ -2366,7 +2378,7 @@ async function refreshTable(host, request, clock = systemClock2) {
   const read = await readIssues(client, ordered);
   if (!read.ok) return jiraFailed(read.error);
   const fetchedAt = new Date(clock.now()).toISOString();
-  const nameOf = (name) => existing.get(name)?.name ?? name;
+  const nameOf = (name) => existing.get(name.toLowerCase())?.name ?? name;
   const live = /* @__PURE__ */ new Map();
   for (const [index, issue] of ordered.entries()) {
     const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
@@ -2377,14 +2389,16 @@ async function refreshTable(host, request, clock = systemClock2) {
     });
     if (!row.ok) return jiraFailed(row.error);
     const values = {};
-    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
+    for (const [name, value] of Object.entries(row.value.values)) {
+      values[nameOf(written(name))] = value;
+    }
     live.set(issue.key, {
       key: issue.key,
       values,
       provenance: { source: REFRESH_VERB_ID, id: issue.key, fetchedAt }
     });
   }
-  const added = targets.filter((target) => !existing.has(target.name));
+  const added = targets.filter((target) => !existing.has(target.name.toLowerCase()));
   const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
   const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
   const askedKeys = new Set(keys);
@@ -2446,7 +2460,18 @@ function readArguments(request) {
       `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`
     );
   }
-  return { by, only, children: request.arguments["children"] === true };
+  const prefix = request.arguments["prefix"];
+  if (prefix !== void 0 && !PREFIX.test(String(prefix).trim())) {
+    return problem5(
+      `prefix= is '${String(prefix)}'; a prefix is letters, digits and underscores, a letter first, such as jira_`
+    );
+  }
+  return {
+    by,
+    only,
+    children: request.arguments["children"] === true,
+    prefix: prefix === void 0 ? "" : String(prefix).trim()
+  };
 }
 async function fetchIssues(client, keys, fields) {
   const answered2 = await bulkIssues(client, keys, fields);
@@ -2607,8 +2632,11 @@ function configError2(message) {
 // src/transition.ts
 var TRANSITION_WRITE = "transition";
 var ARGUMENTS7 = [
-  { name: "to", type: "text", required: true },
-  { name: "workflow", type: "text" }
+  { name: "to", type: "text" },
+  { name: "to-column", type: "text" },
+  { name: "workflow", type: "text" },
+  { name: "workflow-column", type: "text" },
+  { name: "from-column", type: "text" }
 ];
 var REACHED_NAMED = 12;
 function transitionVerb(host, clock = systemClock) {
@@ -2621,36 +2649,73 @@ function transitionVerb(host, clock = systemClock) {
     apply: (request) => applyTransitions(host, request, clock)
   };
 }
+function sourceOf(request, literal, column) {
+  const value = request.arguments[literal];
+  const named2 = request.arguments[column];
+  if (value !== void 0 && named2 !== void 0) {
+    return problem6(
+      `takes ${literal}= or ${column}=, not both; ${literal}= is one value for every row`
+    );
+  }
+  if (named2 !== void 0) {
+    const found = columnNamed(request.table, String(named2).trim());
+    if (found === void 0) {
+      return problem6(`${column}= names '${String(named2)}', which is not a column of the table`);
+    }
+    if (found.type !== "text") {
+      return problem6(`${column}= names ${found.name}, a ${found.type} column; name a text column`);
+    }
+    return { kind: "column", column: found.name };
+  }
+  if (value !== void 0) return { kind: "value", value: String(value).trim() };
+  return { kind: "none" };
+}
+function cellText2(row, column) {
+  const value = row.values[column];
+  return typeof value === "string" ? value.trim() : "";
+}
+function missingWorkflow(section, name) {
+  const known = workflowNames(section);
+  return `workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`);
+}
 async function planTransitions(host, request) {
   const { table } = request;
-  const to = String(request.arguments["to"] ?? "").trim();
-  if (to === "") return planRefused(problem6("needs to=, the status to move each issue to"));
-  const workflowName = request.arguments["workflow"];
-  let workflow;
-  if (workflowName !== void 0) {
-    const name = String(workflowName).trim();
-    const read = workflowOf(request.section, name);
+  const target = sourceOf(request, "to", "to-column");
+  if ("severity" in target) return planRefused(target);
+  if (target.kind === "none" || target.kind === "value" && target.value === "") {
+    return planRefused(
+      problem6("needs to=, the status to move each issue to, or to-column=, the column holding it")
+    );
+  }
+  const workflowSource = sourceOf(request, "workflow", "workflow-column");
+  if ("severity" in workflowSource) return planRefused(workflowSource);
+  let fixedWorkflow;
+  if (workflowSource.kind === "value") {
+    const read = workflowOf(request.section, workflowSource.value);
     if (!read.ok) return planRefused(verbFailed(read.error, TRANSITION_VERB_ID));
     if (read.value === void 0) {
-      const known = workflowNames(request.section);
       return planRefused(
-        problem6(
-          `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` + (known.length === 0 ? "do not hold; it has none" : `do not hold (${known.join(", ")})`)
-        )
+        problem6(`names ${missingWorkflow(request.section, workflowSource.value)}`)
       );
     }
-    workflow = read.value;
+    fixedWorkflow = read.value;
   }
-  const status = columnNamed(table, "status");
+  const fromWritten = request.arguments["from-column"];
+  const status = columnNamed(table, String(fromWritten ?? "status").trim());
   if (status === void 0) {
     return planRefused(
-      problem6("needs the status column jira.pull answers, to know where each issue starts")
+      fromWritten === void 0 ? problem6("needs the status column jira.pull answers, to know where each issue starts") : problem6(
+        `from-column= names '${String(fromWritten)}', which is not a column of the table`
+      )
     );
   }
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return planRefused(verbFailed(config.error, TRANSITION_VERB_ID));
+  const workflows = /* @__PURE__ */ new Map();
   const operations = [];
   for (const row of table.rows) {
+    const to = target.kind === "value" ? target.value : cellText2(row, target.column);
+    if (to === "") continue;
     const key = issueKeyOf(row);
     if (key === void 0) {
       operations.push(
@@ -2676,6 +2741,27 @@ async function planTransitions(host, request) {
       continue;
     }
     if (same(from, to)) continue;
+    let workflow = fixedWorkflow;
+    const workflowName = workflowSource.kind === "column" ? cellText2(row, workflowSource.column) : "";
+    if (workflowName !== "") {
+      if (!workflows.has(workflowName)) {
+        const read = workflowOf(request.section, workflowName);
+        if (!read.ok) return planRefused(verbFailed(read.error, TRANSITION_VERB_ID));
+        workflows.set(workflowName, read.value);
+      }
+      workflow = workflows.get(workflowName);
+      if (workflow === void 0) {
+        operations.push(
+          plannedFailure(
+            TRANSITION_WRITE,
+            row.key,
+            `${key}: ${from} \u2192 ${to}`,
+            `E_JIRA_CONFIG: ${key} names ${missingWorkflow(request.section, workflowName)}`
+          )
+        );
+        continue;
+      }
+    }
     let path = [to];
     if (workflow !== void 0) {
       const found = shortestPath(workflow, from, to);

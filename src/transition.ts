@@ -8,9 +8,11 @@ import {
   verbFailed,
   type ApplyAnswer,
   type ArgumentSpec,
+  type Diagnostic,
   type PlanAnswer,
   type PlannedOperation,
   type PlanRequest,
+  type Row,
 } from './diagnostics.js';
 import { jiraError, jiraOk, type JiraResult } from './errors.js';
 import type { JiraClient } from './http.js';
@@ -38,22 +40,28 @@ import { shortestPath, workflowNames, workflowOf, type Workflow } from './write/
 export const TRANSITION_WRITE = 'transition';
 
 const ARGUMENTS: readonly ArgumentSpec[] = [
-  { name: 'to', type: 'text', required: true },
+  { name: 'to', type: 'text' },
+  { name: 'to-column', type: 'text' },
   { name: 'workflow', type: 'text' },
+  { name: 'workflow-column', type: 'text' },
+  { name: 'from-column', type: 'text' },
 ];
 
 /** How many statuses a planned failure names as reached, so its reason stays short. */
 const REACHED_NAMED = 12;
 
 /**
- * `jira.transition to=<status> [workflow=<name>]`: moves each row's issue to a status, from the
- * status the table read (`jira.pull`'s `status` column).
+ * `jira.transition (to=<status> | to-column=<column>) [workflow=<name> | workflow-column=<column>]
+ * [from-column=<column>]`: moves each row's issue to a status, from the status the table read
+ * (`jira.pull`'s `status` column, or the one `from-column=` names).
  *
- * With `workflow=`, the walk is the shortest path through that workflow of the `workflows` key
- * of the `jira` section, one checked transition per step; without it, one direct step. The plan
- * reads no Jira: a status the workflow cannot reach is a planned failure naming what it does
- * reach. Apply reads every issue of the batch once, walks from where each one stands, and an
- * issue that moved since the plan fails alone.
+ * `to=` is one status for every row; `to-column=` reads each row's own, and a row whose cell is
+ * empty plans nothing, which is how a recipe moves only the rows a step before it chose. With a
+ * workflow, the walk is the shortest path through that workflow of the `workflows` key of the
+ * `jira` section, one checked transition per step; without one, one direct step. The plan reads
+ * no Jira: a status the workflow cannot reach is a planned failure of that row alone, naming what
+ * it does reach. Apply reads every issue of the batch once, walks from where each one stands, and
+ * an issue that moved since the plan fails alone.
  */
 export function transitionVerb(
   host: WriteHost,
@@ -69,39 +77,91 @@ export function transitionVerb(
   };
 }
 
+/** Where each row's target, or its workflow, comes from: one value, or a column per row. */
+type Source =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'value'; readonly value: string }
+  | { readonly kind: 'column'; readonly column: string };
+
+/** The source a pair of arguments names: `literal=` or `column=`, never both. */
+function sourceOf(request: PlanRequest, literal: string, column: string): Source | Diagnostic {
+  const value = request.arguments[literal];
+  const named = request.arguments[column];
+  if (value !== undefined && named !== undefined) {
+    return problem(
+      `takes ${literal}= or ${column}=, not both; ${literal}= is one value for every row`,
+    );
+  }
+  if (named !== undefined) {
+    const found = columnNamed(request.table, String(named).trim());
+    if (found === undefined) {
+      return problem(`${column}= names '${String(named)}', which is not a column of the table`);
+    }
+    if (found.type !== 'text') {
+      return problem(`${column}= names ${found.name}, a ${found.type} column; name a text column`);
+    }
+    return { kind: 'column', column: found.name };
+  }
+  if (value !== undefined) return { kind: 'value', value: String(value).trim() };
+  return { kind: 'none' };
+}
+
+function cellText(row: Row, column: string): string {
+  const value = row.values[column];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function missingWorkflow(section: unknown, name: string): string {
+  const known = workflowNames(section);
+  return (
+    `workflow=${name}, which the workflows of the jira section of .tyto/project.json ` +
+    (known.length === 0 ? 'do not hold; it has none' : `do not hold (${known.join(', ')})`)
+  );
+}
+
 export async function planTransitions(host: WriteHost, request: PlanRequest): Promise<PlanAnswer> {
   const { table } = request;
-  const to = String(request.arguments['to'] ?? '').trim();
-  if (to === '') return planRefused(problem('needs to=, the status to move each issue to'));
-  const workflowName = request.arguments['workflow'];
-  let workflow: Workflow | undefined;
-  if (workflowName !== undefined) {
-    const name = String(workflowName).trim();
-    const read = workflowOf(request.section, name);
+  const target = sourceOf(request, 'to', 'to-column');
+  if ('severity' in target) return planRefused(target);
+  if (target.kind === 'none' || (target.kind === 'value' && target.value === '')) {
+    return planRefused(
+      problem('needs to=, the status to move each issue to, or to-column=, the column holding it'),
+    );
+  }
+  const workflowSource = sourceOf(request, 'workflow', 'workflow-column');
+  if ('severity' in workflowSource) return planRefused(workflowSource);
+  let fixedWorkflow: Workflow | undefined;
+  if (workflowSource.kind === 'value') {
+    const read = workflowOf(request.section, workflowSource.value);
     if (!read.ok) return planRefused(verbFailed(read.error, TRANSITION_VERB_ID));
     if (read.value === undefined) {
-      const known = workflowNames(request.section);
       return planRefused(
-        problem(
-          `names workflow=${name}, which the workflows of the jira section of .tyto/project.json ` +
-            (known.length === 0 ? 'do not hold; it has none' : `do not hold (${known.join(', ')})`),
-        ),
+        problem(`names ${missingWorkflow(request.section, workflowSource.value)}`),
       );
     }
-    workflow = read.value;
+    fixedWorkflow = read.value;
   }
-  const status = columnNamed(table, 'status');
+  const fromWritten = request.arguments['from-column'];
+  const status = columnNamed(table, String(fromWritten ?? 'status').trim());
   if (status === undefined) {
     return planRefused(
-      problem('needs the status column jira.pull answers, to know where each issue starts'),
+      fromWritten === undefined
+        ? problem('needs the status column jira.pull answers, to know where each issue starts')
+        : problem(
+            `from-column= names '${String(fromWritten)}', which is not a column of the table`,
+          ),
     );
   }
 
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return planRefused(verbFailed(config.error, TRANSITION_VERB_ID));
 
+  const workflows = new Map<string, Workflow | undefined>();
   const operations: PlannedOperation[] = [];
   for (const row of table.rows) {
+    const to = target.kind === 'value' ? target.value : cellText(row, target.column);
+    // An empty target is a row a step before chose not to move: there is nothing to plan.
+    if (to === '') continue;
     const key = issueKeyOf(row);
     if (key === undefined) {
       operations.push(
@@ -127,6 +187,28 @@ export async function planTransitions(host: WriteHost, request: PlanRequest): Pr
       continue;
     }
     if (same(from, to)) continue;
+    let workflow = fixedWorkflow;
+    const workflowName =
+      workflowSource.kind === 'column' ? cellText(row, workflowSource.column) : '';
+    if (workflowName !== '') {
+      if (!workflows.has(workflowName)) {
+        const read = workflowOf(request.section, workflowName);
+        if (!read.ok) return planRefused(verbFailed(read.error, TRANSITION_VERB_ID));
+        workflows.set(workflowName, read.value);
+      }
+      workflow = workflows.get(workflowName);
+      if (workflow === undefined) {
+        operations.push(
+          plannedFailure(
+            TRANSITION_WRITE,
+            row.key,
+            `${key}: ${from} → ${to}`,
+            `E_JIRA_CONFIG: ${key} names ${missingWorkflow(request.section, workflowName)}`,
+          ),
+        );
+        continue;
+      }
+    }
     let path: readonly string[] = [to];
     if (workflow !== undefined) {
       const found = shortestPath(workflow, from, to);
