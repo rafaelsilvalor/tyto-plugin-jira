@@ -170,6 +170,140 @@ describe('jira.transition plans', () => {
   });
 });
 
+describe('jira.transition with a target per row', () => {
+  const PER_ROW = [
+    { name: 'target', type: 'text', origin: 'sheet' },
+    { name: 'flow', type: 'text', origin: 'sheet' },
+  ] as const;
+
+  it('reads each row its target and workflow; an empty target plans nothing, a bad one fails alone', async () => {
+    const state = issues({
+      'EX-1': 'To Do',
+      'EX-2': 'Review',
+      'EX-3': 'Done',
+      'EX-4': 'In Progress',
+      'EX-5': 'To Do',
+    });
+    const jira = await site([jiraWrites(state, JIRA_TRANSITIONS)]);
+    const answer = await planAndApply(
+      jira,
+      'jira.transition to-column=target workflow-column=flow',
+      pulled(
+        [
+          ['EX-1', 'To Do'],
+          ['EX-2', 'Review'],
+          ['EX-3', 'Done'],
+          ['EX-4', 'In Progress'],
+          ['EX-5', 'To Do'],
+        ],
+        [...PER_ROW],
+        {
+          'EX-1': { target: 'Done', flow: 'delivery' },
+          'EX-2': { target: '', flow: 'delivery' },
+          'EX-3': { target: 'Blocked', flow: 'delivery' },
+          'EX-4': { target: 'Review', flow: null },
+          'EX-5': { target: 'Done', flow: 'release' },
+        },
+      ),
+    );
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.plan?.operations.map((operation) => operation.rowKey)).toEqual([
+      'EX-1',
+      'EX-3',
+      'EX-4',
+      'EX-5',
+    ]);
+    expect(answer.plan?.operations[0]?.payload).toEqual({
+      k: 'EX-1',
+      f: 'To Do',
+      p: ['In Progress', 'Review', 'Done'],
+      w: 'delivery',
+    });
+    expect(answer.plan?.operations[2]?.payload).toEqual({
+      k: 'EX-4',
+      f: 'In Progress',
+      p: ['Review'],
+    });
+    expect(answer.applied).toEqual([
+      { status: 'applied', reason: 'walked To Do → In Progress → Review → Done' },
+      {
+        status: 'failed',
+        reason:
+          'E_JIRA_CONFIG: workflow delivery has no path from Done to Blocked; Done has no transition in it',
+      },
+      { status: 'applied', reason: 'walked In Progress → Review' },
+      {
+        status: 'failed',
+        reason:
+          'E_JIRA_CONFIG: EX-5 names workflow=release, which the workflows of the jira section ' +
+          'of .tyto/project.json do not hold (delivery)',
+      },
+    ]);
+    expect(state.get('EX-2')?.status).toBe('Review');
+    expect(state.get('EX-3')?.status).toBe('Done');
+    expect(jira.calls.some((call) => call.path.includes('EX-2'))).toBe(false);
+  });
+
+  it('plans nothing when every target is empty', async () => {
+    const jira = await site([jiraWrites(issues({}), JIRA_TRANSITIONS)]);
+    const ran = await jira.plugin.runRecipe('jira.transition to-column=target', {
+      input: pulled([['EX-1', 'To Do']], [...PER_ROW], { 'EX-1': { target: null } }),
+    });
+    if (!ran.ok) throw new Error('the recipe did not run');
+    expect(ran.value.cells[0]?.plan?.operations).toEqual([]);
+  });
+
+  it('reads where each issue starts from from-column=, leaving a same-named sheet column alone', async () => {
+    const state = issues({ 'EX-1': 'In Progress' });
+    const jira = await site([jiraWrites(state, JIRA_TRANSITIONS)]);
+    const answer = await planAndApply(
+      jira,
+      'jira.transition to-column=target workflow=delivery from-column=jira_status',
+      pulled(
+        [['EX-1', 'SHEET VALUE']],
+        [...PER_ROW, { name: 'jira_status', type: 'text', origin: 'jira' }],
+        { 'EX-1': { target: 'Done', jira_status: 'In Progress' } },
+      ),
+    );
+    expect(answer.plan?.operations[0]?.payload).toEqual({
+      k: 'EX-1',
+      f: 'In Progress',
+      p: ['Review', 'Done'],
+      w: 'delivery',
+    });
+    expect(answer.applied).toEqual([
+      { status: 'applied', reason: 'walked In Progress → Review → Done' },
+    ]);
+  });
+
+  it('refuses to= with to-column=, workflow= with workflow-column=, and a column it lacks', async () => {
+    const jira = await site([]);
+    const input = pulled([['EX-1', 'To Do']], [...PER_ROW], { 'EX-1': { target: 'Done' } });
+    const messages = async (step: string) =>
+      (await planAndApply(jira, step, input)).diagnostics.map(
+        ({ code, message }) => `${code} ${message}`,
+      );
+    expect(await messages('jira.transition to=Done to-column=target')).toEqual([
+      "E_RECIPE_ARGUMENTS 'jira.transition' takes to= or to-column=, not both; to= is one value " +
+        'for every row.',
+    ]);
+    expect(
+      await messages('jira.transition to-column=target workflow=delivery workflow-column=flow'),
+    ).toEqual([
+      "E_RECIPE_ARGUMENTS 'jira.transition' takes workflow= or workflow-column=, not both; " +
+        'workflow= is one value for every row.',
+    ]);
+    expect(await messages('jira.transition to-column=goal')).toEqual([
+      "E_RECIPE_ARGUMENTS 'jira.transition' to-column= names 'goal', which is not a column of the table.",
+    ]);
+    expect(await messages('jira.transition workflow=delivery')).toEqual([
+      "E_RECIPE_ARGUMENTS 'jira.transition' needs to=, the status to move each issue to, or " +
+        'to-column=, the column holding it.',
+    ]);
+    expect(jira.calls).toEqual([]);
+  });
+});
+
 describe('jira.transition applies', () => {
   it('walks a 3-step path with 3 GET and 3 POST after one search', async () => {
     const state = issues({ 'EX-1': 'To Do' });

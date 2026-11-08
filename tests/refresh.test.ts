@@ -317,6 +317,68 @@ describe('jira.refresh rows', () => {
   });
 });
 
+describe('jira.refresh prefix= and row keys', () => {
+  /** A sheet whose rows have keys of their own, a ticket column, and a status of the sheet's. */
+  const tracked: InputTable = {
+    columns: [
+      { name: 'ticket', type: 'text', origin: 'sheet' },
+      { name: 'status', type: 'text', origin: 'sheet' },
+    ],
+    rows: [
+      {
+        key: 'row-7',
+        values: { ticket: 'EX-1', status: 'SHEET DONE' },
+        provenance: { source: 'sheet', id: 'row-7', fetchedAt: '2026-11-01T00:00:00.000Z' },
+      },
+    ],
+  };
+
+  it('writes its columns under the prefix, leaving a column of the same name as it was', async () => {
+    const jira = await site([jiraOf([issue(1)])]);
+    const answer = await run(jira, 'jira.refresh by=ticket prefix=jira_', { input: tracked });
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.table?.columns.map((column) => column.name)).toEqual([
+      'ticket',
+      'status',
+      ...FIXED.map((column) => `jira_${column.split(':')[0] ?? ''}`),
+    ]);
+    expect(answer.table?.rows).toMatchObject([
+      {
+        key: 'row-7',
+        values: {
+          ticket: 'EX-1',
+          status: 'SHEET DONE',
+          jira_key: 'EX-1',
+          jira_status: 'In Progress',
+          jira_summary: 'Issue 1',
+        },
+      },
+    ]);
+  });
+
+  it('keeps each row its key, and without prefix= overwrites the same-named column', async () => {
+    const jira = await site([jiraOf([issue(1)])]);
+    const answer = await run(jira, 'jira.refresh by=ticket', { input: tracked });
+    expect(answer.table?.rows).toMatchObject([
+      { key: 'row-7', values: { ticket: 'EX-1', status: 'In Progress' } },
+    ]);
+  });
+
+  it('refuses a prefix that is not the start of a column name', async () => {
+    const jira = await site([]);
+    const answer = await run(jira, 'jira.refresh prefix="jira status"', { input: tracked });
+    expect(answer.diagnostics).toEqual([
+      {
+        code: 'E_RECIPE_ARGUMENTS',
+        message:
+          "'jira.refresh' prefix= is 'jira status'; a prefix is letters, digits and " +
+          'underscores, a letter first, such as jira_.',
+      },
+    ]);
+    expect(jira.calls).toEqual([]);
+  });
+});
+
 describe('jira.refresh refusals', () => {
   it('refuses 1,001 keys before any request', async () => {
     const keys = Array.from({ length: 1001 }, (_, index) => `EX-${index + 1}`);

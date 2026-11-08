@@ -32,7 +32,11 @@ const ARGUMENTS: readonly ArgumentSpec[] = [
   { name: 'by', type: 'text' },
   { name: 'only', type: 'text' },
   { name: 'children', type: 'boolean' },
+  { name: 'prefix', type: 'text' },
 ];
+
+/** A prefix is a start of a column name: letters, digits and underscores, a letter first. */
+const PREFIX = /^[A-Za-z][A-Za-z0-9_]*$/;
 
 type TransformFunction = NonNullable<RecipeVerbContribution['transform']>;
 type TransformRequest = Parameters<TransformFunction>[0];
@@ -50,9 +54,10 @@ export interface RefreshClock {
 const systemClock: RefreshClock = { now: () => Date.now() };
 
 /**
- * `jira.refresh [by=<column>] [only=<boolean column>] [children=true]`: the table it is handed,
- * with every row that names an issue filled with what Jira holds now, in the columns
- * `jira.pull` answers. It is how a row `recall` brought back gets its current values
+ * `jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text>]`: the
+ * table it is handed, with every row that names an issue filled with what Jira holds now, in the
+ * columns `jira.pull` answers. With `prefix=jira_`, those columns are `jira_status`, `jira_key`
+ * and so on, so a sheet column of the same name (`status`) keeps the person's value. It is how a row `recall` brought back gets its current values
  * (Tyto ADR 0144), and with `children=true`, how `rollup` sees every child of a parent.
  */
 export function refreshVerb(
@@ -75,16 +80,24 @@ export async function refreshTable(
   const { table } = request;
   const asked = readArguments(request);
   if ('severity' in asked) return refused(asked);
-  const { by, only, children } = asked;
+  const { by, only, children, prefix } = asked;
   const mapped = mappedFields(request.section);
   if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
-  const jiraNames = new Set([
-    ...FIXED_COLUMNS.map((column) => column.name),
-    ...mapped.value.map(({ column }) => column),
-  ]);
-  if (by !== undefined && by.name !== 'key' && jiraNames.has(by.name.toLowerCase())) {
+  /** The name this step writes a Jira column under. */
+  const written = (name: string): string => `${prefix}${name}`;
+  const jiraNames = new Set(
+    [
+      ...FIXED_COLUMNS.map((column) => column.name),
+      ...mapped.value.map(({ column }) => column),
+    ].map((name) => written(name).toLowerCase()),
+  );
+  const writtenKey = written('key').toLowerCase();
+  const byName = by?.name.toLowerCase();
+  if (byName !== undefined && byName !== writtenKey && jiraNames.has(byName)) {
     return refused(
-      problem(`by= names ${by.name}, a column this verb writes; name key or a column of your own`),
+      problem(
+        `by= names ${by?.name ?? byName}, a column this verb writes; name key or a column of your own`,
+      ),
     );
   }
 
@@ -138,10 +151,13 @@ export async function refreshTable(
 
   const types = await mappedTypes(client, mapped.value);
   if (!types.ok) return jiraFailed(types.error);
-  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)];
+  const targets = [...FIXED_COLUMNS, ...mappedColumns(mapped.value, types.value)].map((column) => ({
+    ...column,
+    name: written(column.name),
+  }));
   const existing = new Map(table.columns.map((column) => [column.name.toLowerCase(), column]));
   for (const target of targets) {
-    const column = existing.get(target.name);
+    const column = existing.get(target.name.toLowerCase());
     if (column !== undefined && column.type !== target.type) {
       return refused(
         problem(
@@ -173,7 +189,7 @@ export async function refreshTable(
   const read = await readIssues(client, ordered);
   if (!read.ok) return jiraFailed(read.error);
   const fetchedAt = new Date(clock.now()).toISOString();
-  const nameOf = (name: string): string => existing.get(name)?.name ?? name;
+  const nameOf = (name: string): string => existing.get(name.toLowerCase())?.name ?? name;
   const live = new Map<string, Row>();
   for (const [index, issue] of ordered.entries()) {
     const row = issueRow(issue, read.value.comments[index] ?? [], read.value.parents, {
@@ -184,7 +200,9 @@ export async function refreshTable(
     });
     if (!row.ok) return jiraFailed(row.error);
     const values: Record<string, CellValue> = {};
-    for (const [name, value] of Object.entries(row.value.values)) values[nameOf(name)] = value;
+    for (const [name, value] of Object.entries(row.value.values)) {
+      values[nameOf(written(name))] = value;
+    }
     live.set(issue.key, {
       key: issue.key,
       values,
@@ -192,7 +210,7 @@ export async function refreshTable(
     });
   }
 
-  const added = targets.filter((target) => !existing.has(target.name));
+  const added = targets.filter((target) => !existing.has(target.name.toLowerCase()));
   const addedNulls = Object.fromEntries(added.map((column) => [column.name, null]));
   const jiraNulls = Object.fromEntries(targets.map((column) => [nameOf(column.name), null]));
   const askedKeys = new Set(keys);
@@ -241,6 +259,8 @@ interface RefreshArguments {
   readonly by: Column | undefined;
   readonly only: Column | undefined;
   readonly children: boolean;
+  /** What every column this step writes starts with; empty without `prefix=`. */
+  readonly prefix: string;
 }
 
 function readArguments(request: TransformRequest): RefreshArguments | Diagnostic {
@@ -267,7 +287,19 @@ function readArguments(request: TransformRequest): RefreshArguments | Diagnostic
       `only= names ${only.name}, a ${only.type} column; name a true or false one, such as recall's mark=`,
     );
   }
-  return { by, only, children: request.arguments['children'] === true };
+  const prefix = request.arguments['prefix'];
+  if (prefix !== undefined && !PREFIX.test(String(prefix).trim())) {
+    return problem(
+      `prefix= is '${String(prefix)}'; a prefix is letters, digits and underscores, a letter ` +
+        'first, such as jira_',
+    );
+  }
+  return {
+    by,
+    only,
+    children: request.arguments['children'] === true,
+    prefix: prefix === undefined ? '' : String(prefix).trim(),
+  };
 }
 
 /**

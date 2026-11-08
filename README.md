@@ -178,7 +178,7 @@ A transform: it takes the table the steps before it made, and fills each row tha
 issue with what Jira holds now, in the same columns `jira.pull` answers.
 
 ```
-jira.refresh [by=<column>] [only=<boolean column>] [children=true]
+jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text>]
 ```
 
 | Argument        | What it does                                                                       |
@@ -186,7 +186,16 @@ jira.refresh [by=<column>] [only=<boolean column>] [children=true]
 | `by=`           | reads the issue key from this text column instead of the row's key                 |
 | `only=`         | refreshes only the rows where this boolean column is true, such as `recall`'s mark |
 | `children=true` | adds every child of the refreshed issues, so `rollup` sees them all                |
+| `prefix=`       | writes every Jira column under this prefix, such as `jira_status` for `jira_`      |
 
+- **Without `prefix=`, a column of the same name is overwritten**: a sheet's own `status`
+  column takes Jira's status. With `prefix=jira_`, the step writes `jira_key`, `jira_status`,
+  `jira_summary` and so on, and the sheet's `status` keeps the person's value, so a later step
+  (Tyto's `decide`) can compare the two. A prefix is letters, digits and underscores, a letter
+  first.
+- Every row keeps its row key, also when `by=` reads the issue key from another column, so
+  the steps after it (`decide`, `remember`, `jira.transition`) and the state Apply commits
+  match the same row.
 - A column the table lacks is added; a column of the same name and another type is refused,
   so rename it before the step. Columns of your own, and rows `only=` leaves out, pass through
   unchanged.
@@ -199,21 +208,37 @@ jira.refresh [by=<column>] [only=<boolean column>] [children=true]
 
 ## `jira.transition`
 
-An action: it moves each row's issue from the status in the table's `status` column to `to=`.
+An action: it moves each row's issue from the status in the table's `status` column to a
+target status.
 
 ```
-jira.transition to=<status> [workflow=<name>]
+jira.transition (to=<status> | to-column=<column>) [workflow=<name> | workflow-column=<column>]
+                [from-column=<column>]
 ```
 
-- With `workflow=`, it walks the shortest path through that workflow of the `workflows` key,
-  one transition per status. Without it, it takes one direct transition.
+| Argument           | What it does                                                                   |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `to=`              | one target status for every row                                                |
+| `to-column=`       | reads each row's target from this text column; **an empty cell plans nothing** |
+| `workflow=`        | walks every row through this workflow of the `workflows` key                   |
+| `workflow-column=` | reads each row's workflow from this text column; an empty cell is one step     |
+| `from-column=`     | reads where each issue stands from this column instead of `status`             |
+
+- `to=` and `to-column=` are refused together, and so are `workflow=` and `workflow-column=`.
+- With a workflow, it walks the shortest path through it, one transition per status. Without
+  one, it takes one direct transition.
+- `to-column=` is how a recipe moves only the rows a step before it chose: Tyto's `decide`
+  writes `<column>_push`, empty on the rows with nothing to push. A workflow a row names and
+  the `workflows` key lacks fails that row alone.
+- After `jira.refresh prefix=jira_`, `from-column=jira_status` reads Jira's status rather
+  than the sheet's own `status` column.
 - The plan reads nothing from Jira. A status the workflow cannot reach from the row's is a
-  failure planned for that row alone, naming the statuses the workflow does reach. A row
-  already at `to=` is left out of the plan.
+  failure planned for that row alone, naming the statuses the workflow does reach; the other
+  rows still plan and apply. A row already at its target is left out of the plan.
 - At each step, Apply asks the issue which transitions it offers and takes the one that leads to
   the next status (ignoring case). None, or more than one, fails the issue and names them.
 - Apply reads each issue first. **An issue that moved since the plan fails alone**; one already
-  at `to=` is applied with nothing written; one standing on its planned path resumes from there.
+  at its target is applied with nothing written; one standing on its planned path resumes from there.
 
 ## `jira.assign`
 
