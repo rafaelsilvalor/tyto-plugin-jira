@@ -66,6 +66,10 @@ Two settings, in the desktop's `settings.json`:
   own in the `jira` section of `.tyto/project.json`, which wins.
 - `jira.email`: the email, used only when no `email` credential is stored.
 
+Every request carries `X-Atlassian-Token: no-check`, Atlassian's header for REST clients: the
+desktop app sends requests with a browser's User-Agent, and Jira Cloud refuses such a POST with
+"XSRF check failed" without it.
+
 **The token is never a setting, and your email never goes in `.tyto/project.json`.** A setting
 is plain text people paste into bug reports, and the project file is shared by a whole team.
 

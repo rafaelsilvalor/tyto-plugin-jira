@@ -282,6 +282,8 @@ var BACKOFF_MILLISECONDS = [1e3, 2e3, 4e3];
 var RETRIED_STATUSES = /* @__PURE__ */ new Set([429, 503]);
 var QUOTED_BODY_LIMIT = 300;
 var REDACTED = "[redacted]";
+var XSRF_HEADER = "X-Atlassian-Token";
+var XSRF_REFUSAL = "XSRF check failed";
 var defaultSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 function createJiraClient(options) {
   const { fetch, config } = options;
@@ -300,6 +302,11 @@ function createJiraClient(options) {
       headers: {
         Accept: "application/json",
         Authorization: authorization,
+        // Desktop requests leave through Chromium's network stack with a browser User-Agent,
+        // and Jira Cloud runs its XSRF check on a browser's POST unless this header opts out
+        // (Atlassian's documented header for REST clients). Sent on every request: Jira
+        // ignores it on a GET, and one header set keeps every verb alike.
+        [XSRF_HEADER]: "no-check",
         ...body === void 0 ? {} : { "Content-Type": "application/json" }
       },
       ...body === void 0 ? {} : { body: JSON.stringify(body) }
@@ -374,10 +381,12 @@ async function answerOf(response, label, config, redact) {
     );
   }
   if (status === 403) {
+    const text3 = await bodyText(response);
+    const why = text3.includes(XSRF_REFUSAL) ? `Jira's XSRF check refused ${label}: the request reached Jira without the '${XSRF_HEADER}: no-check' header, or something between Tyto and Jira removed it. The account and the token are not the problem.` : `the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once).`;
     return jiraError(
       "E_JIRA_AUTH",
       redact(
-        `Jira refused ${config.email} on ${config.baseUrl} (403): the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once). ` + quotedBody(await bodyText(response))
+        `Jira refused ${config.email} on ${config.baseUrl} (403): ${why} ${quotedBody(text3)}`
       ).trim(),
       { status }
     );
