@@ -41,7 +41,11 @@ describe('createJiraClient', () => {
         url: 'https://example.atlassian.net/rest/api/3/myself',
         init: {
           method: 'GET',
-          headers: { Accept: 'application/json', Authorization: `Basic ${ENCODED}` },
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Basic ${ENCODED}`,
+            'X-Atlassian-Token': 'no-check',
+          },
         },
       },
     ]);
@@ -65,6 +69,40 @@ describe('createJiraClient', () => {
       body: '{"jql":"project = X"}',
       headers: { 'Content-Type': 'application/json' },
     });
+  });
+
+  it('opts out of the XSRF check on every POST and PUT', async () => {
+    const { client, requests } = scripted(
+      hostResponse(200, {}),
+      hostResponse(204),
+      hostResponse(204),
+      hostResponse(201, {}),
+    );
+    await client.post('/rest/api/3/issue/bulkfetch', { issueIdsOrKeys: ['EX-1'] });
+    await client.post('/rest/api/3/issue/EX-1/transitions', { transition: { id: '11' } });
+    await client.put('/rest/api/3/issue/EX-1', { fields: {} });
+    await client.post('/rest/api/3/issue/EX-1/comment', { body: {} });
+    expect(requests).toHaveLength(4);
+    for (const request of requests) {
+      expect(request.init.method).not.toBe('GET');
+      expect(request.init.headers).toMatchObject({ 'X-Atlassian-Token': 'no-check' });
+    }
+  });
+
+  it('says plainly when the 403 is Jira refusing the XSRF check', async () => {
+    const { client } = scripted(hostResponse(403, 'XSRF check failed'));
+    const answer = await client.post('/rest/api/3/issue/bulkfetch', { issueIdsOrKeys: ['EX-1'] });
+    const error = answer.ok ? undefined : answer.error;
+    expect(error).toMatchObject({ code: 'E_JIRA_AUTH', status: 403 });
+    expect(error?.message).toContain("Jira's XSRF check refused POST /rest/api/3/issue/bulkfetch");
+    expect(error?.message).toContain('The account and the token are not the problem.');
+    expect(error?.message).not.toContain('CAPTCHA');
+  });
+
+  it('keeps the permission reading for any other 403', async () => {
+    const { client } = scripted(hostResponse(403, { errorMessages: ['Nope'] }));
+    const answer = await client.post('/rest/api/3/issue/bulkfetch', {});
+    expect(answer.ok ? undefined : answer.error.message).toContain('CAPTCHA');
   });
 
   it.each([401, 403])(

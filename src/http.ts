@@ -41,6 +41,10 @@ const RETRIED_STATUSES: ReadonlySet<number> = new Set([429, 503]);
 /** How much of Jira's own error body a message quotes. */
 const QUOTED_BODY_LIMIT = 300;
 const REDACTED = '[redacted]';
+/** The header that tells Jira this is a REST client, not a browser form. */
+export const XSRF_HEADER = 'X-Atlassian-Token';
+/** What Jira Cloud's body says when its XSRF check refused a request. */
+const XSRF_REFUSAL = 'XSRF check failed';
 
 const defaultSleep = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -77,6 +81,11 @@ export function createJiraClient(options: JiraClientOptions): JiraClient {
       headers: {
         Accept: 'application/json',
         Authorization: authorization,
+        // Desktop requests leave through Chromium's network stack with a browser User-Agent,
+        // and Jira Cloud runs its XSRF check on a browser's POST unless this header opts out
+        // (Atlassian's documented header for REST clients). Sent on every request: Jira
+        // ignores it on a GET, and one header set keeps every verb alike.
+        [XSRF_HEADER]: 'no-check',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -166,12 +175,20 @@ async function answerOf(
     );
   }
   if (status === 403) {
+    const text = await bodyText(response);
+    // The XSRF refusal is not about the account: saying "permission or CAPTCHA" sent a person
+    // to the wrong place. Kept as E_JIRA_AUTH so a write batch still stops at the first one,
+    // as it does for every other refusal that would repeat on each row.
+    const why = text.includes(XSRF_REFUSAL)
+      ? `Jira's XSRF check refused ${label}: the request reached Jira without the ` +
+        `'${XSRF_HEADER}: no-check' header, or something between Tyto and Jira removed it. ` +
+        'The account and the token are not the problem.'
+      : `the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins ` +
+        '(sign in on the site once).';
     return jiraError(
       'E_JIRA_AUTH',
       redact(
-        `Jira refused ${config.email} on ${config.baseUrl} (403): the account may not do ` +
-          `${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once). ` +
-          quotedBody(await bodyText(response)),
+        `Jira refused ${config.email} on ${config.baseUrl} (403): ${why} ${quotedBody(text)}`,
       ).trim(),
       { status },
     );
