@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import type { JiraConfig } from '../src/config.js';
+import { readFileSync } from 'node:fs';
+
 import { base64, createJiraClient, type JiraFetch } from '../src/http.js';
 import { hostResponse, jiraHost, response, type FakeRequest } from './host.js';
 
@@ -10,6 +12,13 @@ const CONFIG: JiraConfig = {
   token: 'test-token-not-real',
 };
 const ENCODED = base64(`${CONFIG.email}:${CONFIG.token}`);
+/** Read from the manifest here, not imported from `src`, so a wrong constant cannot pass. */
+const MANIFEST_VERSION = (
+  JSON.parse(readFileSync(new URL('../tyto-plugin.json', import.meta.url), 'utf8')) as {
+    version: string;
+  }
+).version;
+const USER_AGENT = `tyto-plugin-jira/${MANIFEST_VERSION}`;
 
 /** A fake `fetch` that answers in turn, and records what it was asked. */
 function scripted(...answers: ReturnType<typeof hostResponse>[]) {
@@ -44,6 +53,7 @@ describe('createJiraClient', () => {
           headers: {
             Accept: 'application/json',
             Authorization: `Basic ${ENCODED}`,
+            'User-Agent': USER_AGENT,
             'X-Atlassian-Token': 'no-check',
           },
         },
@@ -89,12 +99,30 @@ describe('createJiraClient', () => {
     }
   });
 
+  it('names itself with the manifest version on every GET, POST and PUT', async () => {
+    const { client, requests } = scripted(
+      hostResponse(200, {}),
+      hostResponse(200, {}),
+      hostResponse(204),
+    );
+    await client.get('/rest/api/3/search/jql', { jql: 'project = EX' });
+    await client.post('/rest/api/3/issue/bulkfetch', { issueIdsOrKeys: ['EX-1'] });
+    await client.put('/rest/api/3/issue/EX-1', { fields: {} });
+    expect(requests.map((request) => request.init.method)).toEqual(['GET', 'POST', 'PUT']);
+    expect(MANIFEST_VERSION).toMatch(/^\d+\.\d+\.\d+/);
+    for (const request of requests) {
+      expect(request.init.headers).toMatchObject({ 'User-Agent': USER_AGENT });
+    }
+  });
+
   it('says plainly when the 403 is Jira refusing the XSRF check', async () => {
     const { client } = scripted(hostResponse(403, 'XSRF check failed'));
     const answer = await client.post('/rest/api/3/issue/bulkfetch', { issueIdsOrKeys: ['EX-1'] });
     const error = answer.ok ? undefined : answer.error;
     expect(error).toMatchObject({ code: 'E_JIRA_AUTH', status: 403 });
     expect(error?.message).toContain("Jira's XSRF check refused POST /rest/api/3/issue/bulkfetch");
+    expect(error?.message).toContain("Jira took the request for a browser's");
+    expect(error?.message).toContain(`'User-Agent: ${USER_AGENT}'`);
     expect(error?.message).toContain('The account and the token are not the problem.');
     expect(error?.message).not.toContain('CAPTCHA');
   });

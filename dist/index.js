@@ -275,6 +275,9 @@ function unique(values) {
   return [...new Set(values)];
 }
 
+// tyto-plugin.json
+var version = "0.1.0";
+
 // src/http.ts
 var MAX_RETRIES = 3;
 var MAX_RETRY_AFTER_SECONDS = 30;
@@ -284,6 +287,7 @@ var QUOTED_BODY_LIMIT = 300;
 var REDACTED = "[redacted]";
 var XSRF_HEADER = "X-Atlassian-Token";
 var XSRF_REFUSAL = "XSRF check failed";
+var USER_AGENT = `tyto-plugin-jira/${version}`;
 var defaultSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 function createJiraClient(options) {
   const { fetch, config } = options;
@@ -303,9 +307,11 @@ function createJiraClient(options) {
         Accept: "application/json",
         Authorization: authorization,
         // Desktop requests leave through Chromium's network stack with a browser User-Agent,
-        // and Jira Cloud runs its XSRF check on a browser's POST unless this header opts out
-        // (Atlassian's documented header for REST clients). Sent on every request: Jira
-        // ignores it on a GET, and one header set keeps every verb alike.
+        // and Jira Cloud runs its XSRF check on a browser's POST even with the opt-out header
+        // (measured 2026-11-08: 403 with Electron's User-Agent, 200 with this one). Both are
+        // sent on every request: Jira ignores them on a GET, and one header set keeps every
+        // verb alike.
+        "User-Agent": USER_AGENT,
         [XSRF_HEADER]: "no-check",
         ...body === void 0 ? {} : { "Content-Type": "application/json" }
       },
@@ -382,7 +388,7 @@ async function answerOf(response, label, config, redact) {
   }
   if (status === 403) {
     const text3 = await bodyText(response);
-    const why = text3.includes(XSRF_REFUSAL) ? `Jira's XSRF check refused ${label}: the request reached Jira without the '${XSRF_HEADER}: no-check' header, or something between Tyto and Jira removed it. The account and the token are not the problem.` : `the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once).`;
+    const why = text3.includes(XSRF_REFUSAL) ? `Jira's XSRF check refused ${label}: Jira took the request for a browser's. The plugin sent 'User-Agent: ${USER_AGENT}' and '${XSRF_HEADER}: no-check', so the app or a proxy between Tyto and Jira may have replaced that User-Agent. The account and the token are not the problem.` : `the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins (sign in on the site once).`;
     return jiraError(
       "E_JIRA_AUTH",
       redact(
