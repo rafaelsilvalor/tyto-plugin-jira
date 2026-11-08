@@ -68,7 +68,10 @@ Two settings, in the desktop's `settings.json`:
 
 Every request carries `X-Atlassian-Token: no-check`, Atlassian's header for REST clients: the
 desktop app sends requests with a browser's User-Agent, and Jira Cloud refuses such a POST with
-"XSRF check failed" without it.
+"XSRF check failed" without it. It also names itself with `User-Agent: tyto-plugin-jira/<version>`,
+because the opt-out header is not enough on its own: measured against a Jira Cloud site on
+2026-11-08, the same POST with that header answered 403 with Electron's default User-Agent and
+200 with the plugin's own.
 
 **The token is never a setting, and your email never goes in `.tyto/project.json`.** A setting
 is plain text people paste into bug reports, and the project file is shared by a whole team.

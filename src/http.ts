@@ -1,5 +1,6 @@
 import type { HostFetchInit, HostFetchResponse } from '@tyto/plugin-api';
 
+import { version } from '../tyto-plugin.json';
 import type { JiraConfig } from './config.js';
 import { hostCodeOf, jiraError, jiraOk, messageOf, type JiraResult } from './errors.js';
 
@@ -45,6 +46,13 @@ const REDACTED = '[redacted]';
 export const XSRF_HEADER = 'X-Atlassian-Token';
 /** What Jira Cloud's body says when its XSRF check refused a request. */
 const XSRF_REFUSAL = 'XSRF check failed';
+/**
+ * The User-Agent every request names. Jira Cloud runs its XSRF check on any POST whose
+ * User-Agent looks like a browser's, `X-Atlassian-Token` or not, and the desktop's fetch sends
+ * Electron's browser-like one unless the request sets its own. The version is the manifest's,
+ * inlined by the build: no request is spent finding it.
+ */
+export const USER_AGENT = `tyto-plugin-jira/${version}`;
 
 const defaultSleep = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -82,9 +90,11 @@ export function createJiraClient(options: JiraClientOptions): JiraClient {
         Accept: 'application/json',
         Authorization: authorization,
         // Desktop requests leave through Chromium's network stack with a browser User-Agent,
-        // and Jira Cloud runs its XSRF check on a browser's POST unless this header opts out
-        // (Atlassian's documented header for REST clients). Sent on every request: Jira
-        // ignores it on a GET, and one header set keeps every verb alike.
+        // and Jira Cloud runs its XSRF check on a browser's POST even with the opt-out header
+        // (measured 2026-11-08: 403 with Electron's User-Agent, 200 with this one). Both are
+        // sent on every request: Jira ignores them on a GET, and one header set keeps every
+        // verb alike.
+        'User-Agent': USER_AGENT,
         [XSRF_HEADER]: 'no-check',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
@@ -180,8 +190,9 @@ async function answerOf(
     // to the wrong place. Kept as E_JIRA_AUTH so a write batch still stops at the first one,
     // as it does for every other refusal that would repeat on each row.
     const why = text.includes(XSRF_REFUSAL)
-      ? `Jira's XSRF check refused ${label}: the request reached Jira without the ` +
-        `'${XSRF_HEADER}: no-check' header, or something between Tyto and Jira removed it. ` +
+      ? `Jira's XSRF check refused ${label}: Jira took the request for a browser's. The ` +
+        `plugin sent 'User-Agent: ${USER_AGENT}' and '${XSRF_HEADER}: no-check', so the app or a ` +
+        'proxy between Tyto and Jira may have replaced that User-Agent. ' +
         'The account and the token are not the problem.'
       : `the account may not do ${label}, or Jira wants a CAPTCHA after failed sign-ins ` +
         '(sign in on the site once).';
