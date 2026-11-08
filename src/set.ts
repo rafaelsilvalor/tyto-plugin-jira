@@ -21,7 +21,7 @@ import {
   type PlannedOperation,
   type PlanRequest,
 } from './diagnostics.js';
-import { mappedFields, projected, textOf } from './fields.js';
+import { chosenBy, mappedFields, projected, textOf } from './fields.js';
 import { createJiraClient } from './http.js';
 import { textToAdf } from './write/adf.js';
 import {
@@ -50,6 +50,8 @@ export const SET_WRITE = 'field';
 const ARGUMENTS: readonly ArgumentSpec[] = [
   { name: 'field', type: 'text', required: true },
   { name: 'value', type: 'text', required: true },
+  { name: 'only', type: 'text' },
+  { name: 'from-column', type: 'text' },
 ];
 
 /** The parts of the host `jira.set` uses: a write's, and the cache its plan reads. */
@@ -71,14 +73,20 @@ const TEXTAREA = ':textarea';
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
- * `jira.set field=<field> value=<column>`: sets one field of each row's issue to the row's cell,
- * through `PUT /issue/{key}`.
+ * `jira.set field=<field> value=<column> [only=<column>] [from-column=<column>]`: sets one field
+ * of each row's issue to the row's cell, through `PUT /issue/{key}`.
  *
  * `field=` is a column the `fields:` of the `jira` section maps, or one of `summary`, `labels`,
  * `duedate` and `priority`. The cell is converted by the field's type, read off the site's field
  * catalogue: an option by its value, a user by account id, a paragraph field as a document.
  * When the table holds a column named like the field, Apply checks Jira still holds what that
- * column read, so an issue edited since the plan fails alone.
+ * column read, so an issue edited since the plan fails alone. `from-column=` names that column
+ * instead, as after `jira.refresh prefix=jira_`, when the column named like the field is the
+ * sheet's own.
+ *
+ * `only=` plans the rows whose cell in that column is true or holds something, and nothing for
+ * the others: a shared field is written back only on the rows a `decide` step chose to push,
+ * while an empty cell on a chosen row still clears the field.
  */
 export function setVerb(host: SetHost, clock: WriteClock = systemClock): RecipeVerbContribution {
   return {
@@ -108,6 +116,20 @@ export async function planSets(
   const valueColumn = columnNamed(table, valueName);
   if (valueColumn === undefined) {
     return planRefused(problem(`value= names '${valueName}', which is not a column of the table`));
+  }
+  const onlyName = request.arguments['only'];
+  const only = onlyName === undefined ? undefined : columnNamed(table, String(onlyName).trim());
+  if (onlyName !== undefined && only === undefined) {
+    return planRefused(
+      problem(`only= names '${String(onlyName)}', which is not a column of the table`),
+    );
+  }
+  const fromName = request.arguments['from-column'];
+  const readFrom = fromName === undefined ? undefined : columnNamed(table, String(fromName).trim());
+  if (fromName !== undefined && readFrom === undefined) {
+    return planRefused(
+      problem(`from-column= names '${String(fromName)}', which is not a column of the table`),
+    );
   }
 
   const config = await resolveJiraConfig(host, request.section);
@@ -148,10 +170,11 @@ export async function planSets(
     );
   }
   const target: Target = { id, name, kind };
-  const before = columnNamed(table, name);
+  const before = readFrom ?? columnNamed(table, name);
 
   const operations: PlannedOperation[] = [];
   for (const row of table.rows) {
+    if (only !== undefined && !chosenBy(row, only)) continue;
     const key = issueKeyOf(row);
     if (key === undefined) {
       operations.push(

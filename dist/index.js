@@ -974,6 +974,12 @@ function projected(value) {
   if (typeof value === "number") return value;
   return textOf(value);
 }
+function chosenBy(row, column) {
+  const cell = row.values[column.name] ?? null;
+  if (column.type === "boolean") return cell === true;
+  const shown2 = projected(cell);
+  return shown2 !== null && (typeof shown2 !== "string" || shown2.trim() !== "");
+}
 function configError(message) {
   return jiraError("E_JIRA_CONFIG", `${message}.`);
 }
@@ -1718,7 +1724,9 @@ function entryOf2(bytes) {
 var SET_WRITE = "field";
 var ARGUMENTS4 = [
   { name: "field", type: "text", required: true },
-  { name: "value", type: "text", required: true }
+  { name: "value", type: "text", required: true },
+  { name: "only", type: "text" },
+  { name: "from-column", type: "text" }
 ];
 var BUILT_IN = {
   summary: { type: "string" },
@@ -1745,6 +1753,20 @@ async function planSets(host, request, clock = systemClock) {
   const valueColumn = columnNamed(table, valueName);
   if (valueColumn === void 0) {
     return planRefused(problem3(`value= names '${valueName}', which is not a column of the table`));
+  }
+  const onlyName = request.arguments["only"];
+  const only = onlyName === void 0 ? void 0 : columnNamed(table, String(onlyName).trim());
+  if (onlyName !== void 0 && only === void 0) {
+    return planRefused(
+      problem3(`only= names '${String(onlyName)}', which is not a column of the table`)
+    );
+  }
+  const fromName = request.arguments["from-column"];
+  const readFrom = fromName === void 0 ? void 0 : columnNamed(table, String(fromName).trim());
+  if (fromName !== void 0 && readFrom === void 0) {
+    return planRefused(
+      problem3(`from-column= names '${String(fromName)}', which is not a column of the table`)
+    );
   }
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return planRefused(verbFailed(config.error, SET_VERB_ID));
@@ -1782,9 +1804,10 @@ async function planSets(host, request, clock = systemClock) {
     );
   }
   const target = { id, name, kind };
-  const before = columnNamed(table, name);
+  const before = readFrom ?? columnNamed(table, name);
   const operations = [];
   for (const row of table.rows) {
+    if (only !== void 0 && !chosenBy(row, only)) continue;
     const key = issueKeyOf(row);
     if (key === void 0) {
       operations.push(
@@ -2308,7 +2331,7 @@ async function refreshTable(host, request, clock = systemClock2) {
   };
   const keys = [
     ...new Set(
-      table.rows.filter((row) => only === void 0 || row.values[only.name] === true).map(keyOf).filter((key) => key !== void 0)
+      table.rows.filter((row) => only === void 0 || chosenBy(row, only)).map(keyOf).filter((key) => key !== void 0)
     )
   ];
   if (keys.length > MAX_KEYS) {

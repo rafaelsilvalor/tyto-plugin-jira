@@ -205,6 +205,115 @@ describe('jira.set', () => {
     );
   });
 
+  it.each([
+    ['a text column', { name: 'points_push', type: 'text', origin: 'recipe' }, '5', ''],
+    ['a text column of blanks', { name: 'points_push', type: 'text', origin: 'recipe' }, '5', '  '],
+    ['a boolean column', { name: 'points_push', type: 'boolean', origin: 'recipe' }, true, false],
+  ] as const)(
+    'with only= naming %s, plans the chosen rows and nothing for the others',
+    async (_, column, chosen, skipped) => {
+      const jira = await site([jiraWrites(state())]);
+      const table = pulled(
+        [
+          ['EX-1', 'To Do'],
+          ['EX-2', 'To Do'],
+        ],
+        [...NEW, column],
+        { 'EX-1': { new: '5', points_push: chosen }, 'EX-2': { new: '8', points_push: skipped } },
+      );
+      const answer = await planAndApply(
+        jira,
+        'jira.set field=points value=new only=points_push',
+        table,
+      );
+      expect(answer.diagnostics).toEqual([]);
+      expect(answer.plan?.operations.map((each) => each.payload)).toEqual([
+        { k: 'EX-1', fid: 'customfield_10016', v: 5 },
+      ]);
+      expect(answer.applied).toEqual([{ status: 'applied' }]);
+      expect(callsAfter(jira, answer.planCalls).filter((call) => call.startsWith('PUT'))).toEqual([
+        'PUT /rest/api/3/issue/EX-1',
+      ]);
+    },
+  );
+
+  it('with only=, still fails a chosen row alone and skips a row with no key', async () => {
+    const jira = await site([jiraWrites(state())]);
+    const push = { name: 'points_push', type: 'text', origin: 'recipe' } as const;
+    const read = pulled(
+      [
+        ['EX-1', 'To Do'],
+        ['EX-2', 'To Do'],
+      ],
+      [...NEW, push],
+      { 'EX-1': { new: 'many', points_push: 'many' }, 'EX-2': { new: '2', points_push: '2' } },
+    );
+    const noKey = {
+      key: 'r3',
+      values: { key: null, status: null, assignee: null, new: '3', points_push: null },
+      provenance: { source: 'sheet', id: 'r3', fetchedAt: '2026-11-01T00:00:00.000Z' },
+    };
+    const table = { ...read, rows: [...read.rows, noKey] };
+    const answer = await planAndApply(
+      jira,
+      'jira.set field=points value=points_push only=points_push',
+      table,
+    );
+    expect(answer.applied).toEqual([
+      { status: 'failed', reason: 'E_JIRA_PLAN: EX-1: "many" is not a number for points' },
+      { status: 'applied' },
+    ]);
+  });
+
+  it('with from-column=, checks the issue against that column, not the one named like the field', async () => {
+    const issues = state({ customfield_10016: 3 });
+    const jira = await site([jiraWrites(issues)]);
+    const table = pulled(
+      [['EX-1', 'To Do']],
+      [
+        { name: 'points', type: 'number', origin: 'sheet' },
+        { name: 'jira_points', type: 'number', origin: 'jira' },
+      ],
+      { 'EX-1': { points: 5, jira_points: 3 } },
+    );
+    const step = 'jira.set field=points value=points from-column=jira_points';
+    const answer = await planAndApply(jira, step, table);
+    expect(answer.plan?.operations[0]?.description).toBe('EX-1: points 3 → 5');
+    expect(answer.applied).toEqual([{ status: 'applied' }]);
+    const moved = await planAndApply(jira, step, table, () => {
+      (issues.get('EX-1') as FakeIssue).fields = { customfield_10016: 8 };
+    });
+    expect(moved.applied?.[0]?.reason).toMatch(/^E_JIRA_MOVED: EX-1's customfield_10016 is 8 now/);
+  });
+
+  it('refuses only= or from-column= naming a column the table lacks, before any plan', async () => {
+    const jira = await site([jiraWrites(state())]);
+    const answer = await planAndApply(
+      jira,
+      'jira.set field=points value=new only=points_push',
+      oneRow('5'),
+    );
+    expect(answer.diagnostics).toEqual([
+      {
+        code: 'E_RECIPE_ARGUMENTS',
+        message: "'jira.set' only= names 'points_push', which is not a column of the table.",
+      },
+    ]);
+    expect(answer.plan).toBeUndefined();
+    expect(jira.calls).toEqual([]);
+    const from = await planAndApply(
+      jira,
+      'jira.set field=points value=new from-column=jira_points',
+      oneRow('5'),
+    );
+    expect(from.diagnostics).toEqual([
+      {
+        code: 'E_RECIPE_ARGUMENTS',
+        message: "'jira.set' from-column= names 'jira_points', which is not a column of the table.",
+      },
+    ]);
+  });
+
   it('fails every operation after a 401 with E_JIRA_AUTH, and asks Jira nothing more', async () => {
     const refuse: Route = (call) =>
       call.method === 'PUT' && call.path === '/rest/api/3/issue/EX-1' ? response(401) : undefined;
