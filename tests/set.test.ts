@@ -30,6 +30,7 @@ const catalogue = route('GET', '/rest/api/3/field', [
   { id: 'customfield_10030', name: 'Reviewer', schema: { type: 'user' } },
   { id: 'customfield_10040', name: 'Notes', schema: { type: 'string', custom: TEXTAREA } },
   { id: 'customfield_10050', name: 'Sprint', schema: { type: 'array', items: 'json' } },
+  { id: 'customfield_10060', name: 'Area', schema: { type: 'string' } },
 ]);
 const SECTION = {
   fields: {
@@ -38,6 +39,7 @@ const SECTION = {
     reviewer: 'customfield_10030',
     notes: 'customfield_10040',
     sprint: 'customfield_10050',
+    area: 'customfield_10060',
     gone: 'customfield_99999',
   },
 };
@@ -264,6 +266,128 @@ describe('jira.set', () => {
       { status: 'applied' },
     ]);
   });
+
+  /**
+   * A table as `jira.refresh prefix=jira_` and `decide <field> ... clear=push` leave it: the
+   * Jira column, the decided `<field>_push` and the `<field>_pushes` boolean, one row per issue.
+   */
+  function decided(
+    field: string,
+    jiraType: 'text' | 'number' | 'date' | 'list',
+    rows: Readonly<Record<string, { jira: unknown; push: unknown; pushes: boolean }>>,
+  ) {
+    return pulled(
+      Object.keys(rows).map((key) => [key, 'To Do'] as const),
+      [
+        { name: `jira_${field}`, type: jiraType, origin: 'jira' },
+        { name: `${field}_push`, type: jiraType, origin: 'recipe' },
+        { name: `${field}_pushes`, type: 'boolean', origin: 'recipe' },
+      ],
+      Object.fromEntries(
+        Object.entries(rows).map(([key, row]) => [
+          key,
+          {
+            [`jira_${field}`]: row.jira,
+            [`${field}_push`]: row.push,
+            [`${field}_pushes`]: row.pushes,
+          },
+        ]),
+      ) as Parameters<typeof pulled>[2],
+    );
+  }
+
+  it.each([
+    ['team', 'option', 'customfield_10020', { value: 'Blue' }, 'text', 'Blue', null],
+    [
+      'reviewer',
+      'user',
+      'customfield_10030',
+      { accountId: ACCOUNT, displayName: 'A reviewer' },
+      'text',
+      'A reviewer',
+      null,
+    ],
+    ['area', 'text', 'customfield_10060', 'North wing', 'text', 'North wing', null],
+    [
+      'notes',
+      'paragraph',
+      'customfield_10040',
+      {
+        type: 'doc',
+        version: 1,
+        content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Old note' }] }],
+      },
+      'text',
+      'Old note',
+      null,
+    ],
+    ['points', 'number', 'customfield_10016', 3, 'number', 3, null],
+    ['duedate', 'date', 'duedate', '2026-12-01', 'date', '2026-12-01', null],
+    ['labels', 'list of text', 'labels', ['alpha'], 'list', ['alpha'], []],
+  ] as const)(
+    'with only=%s_pushes, a %s field cleared in the sheet since the last run plans clearing it',
+    async (field, _type, id, held, jiraType, read, cleared) => {
+      const jira = await site([jiraWrites(state({ [id]: held }))]);
+      const table = decided(field, jiraType, {
+        'EX-1': { jira: read, push: null, pushes: true },
+        'EX-2': { jira: read, push: null, pushes: false },
+      });
+      const answer = await planAndApply(
+        jira,
+        `jira.set field=${field} value=${field}_push only=${field}_pushes from-column=jira_${field}`,
+        table,
+      );
+      expect(answer.diagnostics).toEqual([]);
+      expect(answer.plan?.operations.map((each) => each.payload)).toEqual([
+        expect.objectContaining({ k: 'EX-1', fid: id, v: cleared }),
+      ]);
+      expect(answer.applied).toEqual([{ status: 'applied' }]);
+      expect(jira.calls.filter((call) => call.method === 'PUT')).toEqual([
+        expect.objectContaining({
+          path: '/rest/api/3/issue/EX-1',
+          body: { fields: { [id]: cleared } },
+        }),
+      ]);
+    },
+  );
+
+  it('with only=<field>_pushes, plans nothing for a row never filled', async () => {
+    const jira = await site([jiraWrites(state())]);
+    const table = decided('team', 'text', {
+      'EX-1': { jira: null, push: null, pushes: false },
+      'EX-2': { jira: null, push: '', pushes: false },
+    });
+    const answer = await planAndApply(
+      jira,
+      'jira.set field=team value=team_push only=team_pushes from-column=jira_team',
+      table,
+    );
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.plan?.operations ?? []).toEqual([]);
+    expect(jira.calls.some((call) => call.method === 'PUT')).toBe(false);
+  });
+
+  it.each([
+    ['priority', 'a priority cannot be empty'],
+    ['summary', 'a summary cannot be empty'],
+  ])(
+    'with only=%s_pushes, a cleared field Jira cannot clear is a failure of that row',
+    async (field, reason) => {
+      const jira = await site([jiraWrites(state())]);
+      const table = decided(field, 'text', {
+        'EX-1': { jira: 'High', push: null, pushes: true },
+      });
+      const answer = await planAndApply(
+        jira,
+        `jira.set field=${field} value=${field}_push only=${field}_pushes`,
+        table,
+      );
+      expect(answer.applied).toEqual([
+        { status: 'failed', reason: `E_JIRA_PLAN: EX-1: ${reason}` },
+      ]);
+      expect(jira.calls.some((call) => call.method === 'PUT')).toBe(false);
+    },
+  );
 
   it('with from-column=, checks the issue against that column, not the one named like the field', async () => {
     const issues = state({ customfield_10016: 3 });
