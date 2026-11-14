@@ -1,7 +1,7 @@
 {
   "name": "jira",
   "version": "0.1.0",
-  "engine": ">=0.15",
+  "engine": ">=0.21",
   "contributes": ["configuration", "recipe-verb"],
   "permissions": ["net:*.atlassian.net", "credentials:api-token", "credentials:email"],
   "namespace": "jira",
