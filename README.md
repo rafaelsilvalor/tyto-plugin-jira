@@ -303,19 +303,27 @@ jira.set field=<field> value=<column> [only=<column>] [from-column=<column>]
   own, and Jira's is `jira_<field>`.
 - `only=` and `from-column=` naming a column the table lacks are refused before a plan.
 - `only=` is how a recipe writes a shared field back only on the rows a step before it chose.
-  Tyto's `decide` writes `<column>_push`, the decided value on a push row and empty on every
-  other. With `{"team": "customfield_10020"}` in the `fields` of the `jira` section:
+  Tyto's `decide` writes `<column>_push`, the value to write, and `<column>_pushes`, true
+  exactly on a push row. With `{"team": "customfield_10020"}` in the `fields` of the `jira`
+  section:
 
   ```
   google.sheet-rows tab=Tasks
   jira.refresh by=key prefix=jira_
   last sync columns=team
-  decide team local=team remote=jira_team last=last_team hold-when-empty=jira_status
+  decide team local=team remote=jira_team last=last_team hold-when-empty=jira_status clear=push
   remember sync columns=team when="team_action != hold"
-  jira.set field=team value=team_push only=team_push from-column=jira_team
+  jira.set field=team value=team_push only=team_pushes from-column=jira_team
   select key team
   google.sheet-sync key=key tab=Tasks
   ```
+
+  `clear=push` makes a cell emptied in the sheet since the last applied run a push of the
+  empty value, so `team_push` is empty on that row while `team_pushes` is true, and the step
+  clears the field in Jira; a cell never filled pushes nothing. That is why `only=` reads
+  `team_pushes`, not `team_push`. A status flow keeps `decide` without `clear=` and
+  `jira.transition to-column=status_push`, so a status cell emptied by mistake never clears
+  anything.
 
   The write comes before `select` and the sync, because each step reads only the table the
   step before it answered.
