@@ -94,6 +94,8 @@ describe('activate', () => {
           { name: 'only', type: 'text' },
           { name: 'children', type: 'boolean' },
           { name: 'prefix', type: 'text' },
+          { name: 'sisters', type: 'text' },
+          { name: 'sisters-jql', type: 'text' },
         ],
       ],
       [

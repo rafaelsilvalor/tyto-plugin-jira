@@ -2304,7 +2304,9 @@ var ARGUMENTS6 = [
   { name: "by", type: "text" },
   { name: "only", type: "text" },
   { name: "children", type: "boolean" },
-  { name: "prefix", type: "text" }
+  { name: "prefix", type: "text" },
+  { name: "sisters", type: "text" },
+  { name: "sisters-jql", type: "text" }
 ];
 var PREFIX = /^[A-Za-z][A-Za-z0-9_]*$/;
 var systemClock2 = { now: () => Date.now() };
@@ -2320,7 +2322,7 @@ async function refreshTable(host, request, clock = systemClock2) {
   const { table } = request;
   const asked = readArguments(request);
   if ("severity" in asked) return refused(asked);
-  const { by, only, children, prefix } = asked;
+  const { by, only, children, prefix, sisters } = asked;
   const mapped = mappedFields(request.section);
   if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
   const written = (name) => `${prefix}${name}`;
@@ -2403,7 +2405,7 @@ async function refreshTable(host, request, clock = systemClock2) {
   for (const issue of found.value.values()) issues.set(issue.key, issue);
   if (children) {
     const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
-    const read2 = await childrenOf(client, parents, fields);
+    const read2 = await childrenOf(client, parents, fields, "");
     if (!read2.ok) return jiraFailed(read2.error);
     if (read2.value === "too many") {
       return refused(
@@ -2411,6 +2413,29 @@ async function refreshTable(host, request, clock = systemClock2) {
       );
     }
     for (const child of read2.value) if (!issues.has(child.key)) issues.set(child.key, child);
+  }
+  if (sisters !== void 0) {
+    const parents = [
+      ...new Set(
+        [...found.value.values()].map((issue) => record(issue.fields["parent"])?.["key"]).filter((key) => typeof key === "string" && ISSUE_KEY.test(key))
+      )
+    ];
+    const read2 = await childrenOf(client, parents, fields, sisterFilter(sisters));
+    if (!read2.ok) return jiraFailed(read2.error);
+    if (read2.value === "too many") {
+      return refused(
+        narrow(
+          `found more than ${count(MAX_CHILDREN)} sisters under ${parents.length === 1 ? "1 parent" : `${count(parents.length)} parents`}`
+        )
+      );
+    }
+    const tableIssues = new Set(table.rows.map(keyOf));
+    const rowKeysNow = new Set(table.rows.map((row) => row.key));
+    for (const sister of read2.value) {
+      if (issues.has(sister.key)) continue;
+      if (rowKeysNow.has(sister.key) && !tableIssues.has(sister.key)) continue;
+      issues.set(sister.key, sister);
+    }
   }
   const ordered = [...issues.values()];
   const read = await readIssues(client, ordered);
@@ -2504,12 +2529,31 @@ function readArguments(request) {
       `prefix= is '${String(prefix)}'; a prefix is letters, digits and underscores, a letter first, such as jira_`
     );
   }
+  const sisterType = request.arguments["sisters"];
+  const sisterJql = request.arguments["sisters-jql"];
+  if (sisterType !== void 0 && String(sisterType).trim() === "") {
+    return problem5("sisters= is empty; name the issue type of the sisters, such as COPYWRITER");
+  }
+  if (sisterJql !== void 0 && sisterType === void 0) {
+    return problem5("sisters-jql= narrows sisters=; name the issue type with sisters= too");
+  }
+  if (sisterJql !== void 0 && String(sisterJql).trim() === "") {
+    return problem5("sisters-jql= is empty; write a JQL clause, or leave it out");
+  }
   return {
     by,
     only,
     children: request.arguments["children"] === true,
-    prefix: prefix === void 0 ? "" : String(prefix).trim()
+    prefix: prefix === void 0 ? "" : String(prefix).trim(),
+    sisters: sisterType === void 0 ? void 0 : {
+      issueType: String(sisterType).trim(),
+      jql: sisterJql === void 0 ? void 0 : String(sisterJql).trim()
+    }
   };
+}
+function sisterFilter({ issueType, jql }) {
+  const quoted = `"${issueType.replace(/["\\]/g, (character) => "\\" + character)}"`;
+  return ` AND issuetype = ${quoted}${jql === void 0 ? "" : ` AND (${jql})`}`;
 }
 async function fetchIssues(client, keys, fields) {
   const answered2 = await bulkIssues(client, keys, fields);
@@ -2540,10 +2584,11 @@ async function fetchIssues(client, keys, fields) {
   }
   return jiraOk(found);
 }
-async function childrenOf(client, parents, fields) {
+async function childrenOf(client, parents, fields, filter) {
   const children = [];
   for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
-    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(", ")}) ORDER BY key ASC`;
+    const batch = parents.slice(start, start + PARENTS_PER_SEARCH).join(", ");
+    const jql = `parent in (${batch})${filter} ORDER BY key ASC`;
     let token;
     for (; ; ) {
       const page = await searchPage(client, jql, fields, token);
