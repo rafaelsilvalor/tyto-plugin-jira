@@ -1,6 +1,6 @@
 import type { PluginHost, RecipeVerbContribution } from '@tyto/plugin-api';
 
-import { FIXED_COLUMNS, FIXED_FIELDS, type PulledIssue } from './columns.js';
+import { FIXED_COLUMNS, FIXED_FIELDS, record, type PulledIssue } from './columns.js';
 import { resolveJiraConfig } from './config.js';
 import {
   REFRESH_VERB_ID,
@@ -21,7 +21,7 @@ import { bulkIssues, issueOf, searchPage } from './search.js';
 
 /** Issues one call refreshes at most: ten `bulkfetch` requests. */
 export const MAX_KEYS = 1_000;
-/** Children `children=true` adds at most: a hundred search pages. */
+/** Children `children=true` adds at most, and sisters `sisters=`: a hundred search pages. */
 export const MAX_CHILDREN = 5_000;
 /** How long one call may spend, under the host's 30 s deadline with room to answer. */
 export const BUDGET_MILLISECONDS = 25_000;
@@ -33,6 +33,8 @@ const ARGUMENTS: readonly ArgumentSpec[] = [
   { name: 'only', type: 'text' },
   { name: 'children', type: 'boolean' },
   { name: 'prefix', type: 'text' },
+  { name: 'sisters', type: 'text' },
+  { name: 'sisters-jql', type: 'text' },
 ];
 
 /** A prefix is a start of a column name: letters, digits and underscores, a letter first. */
@@ -54,11 +56,14 @@ export interface RefreshClock {
 const systemClock: RefreshClock = { now: () => Date.now() };
 
 /**
- * `jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text>]`: the
+ * `jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text>]
+ * [sisters=<issue type> [sisters-jql=<clause>]]`: the
  * table it is handed, with every row that names an issue filled with what Jira holds now, in the
  * columns `jira.pull` answers. With `prefix=jira_`, those columns are `jira_status`, `jira_key`
  * and so on, so a sheet column of the same name (`status`) keeps the person's value. It is how a row `recall` brought back gets its current values
- * (Tyto ADR 0144), and with `children=true`, how `rollup` sees every child of a parent.
+ * (Tyto ADR 0144), and with `children=true`, how `rollup` sees every child of a parent. With
+ * `sisters=COPYWRITER`, the other issues of that type under each refreshed issue's parent come
+ * as rows too, so Tyto's `nearest ... within=parent_key` can pick one for each row.
  */
 export function refreshVerb(
   host: RefreshHost,
@@ -80,7 +85,7 @@ export async function refreshTable(
   const { table } = request;
   const asked = readArguments(request);
   if ('severity' in asked) return refused(asked);
-  const { by, only, children, prefix } = asked;
+  const { by, only, children, prefix, sisters } = asked;
   const mapped = mappedFields(request.section);
   if (!mapped.ok) return refused(verbFailed(mapped.error, REFRESH_VERB_ID));
   /** The name this step writes a Jira column under. */
@@ -175,7 +180,7 @@ export async function refreshTable(
   for (const issue of found.value.values()) issues.set(issue.key, issue);
   if (children) {
     const parents = [...new Set([...found.value.values()].map((issue) => issue.key))];
-    const read = await childrenOf(client, parents, fields);
+    const read = await childrenOf(client, parents, fields, '');
     if (!read.ok) return jiraFailed(read.error);
     if (read.value === 'too many') {
       return refused(
@@ -183,6 +188,37 @@ export async function refreshTable(
       );
     }
     for (const child of read.value) if (!issues.has(child.key)) issues.set(child.key, child);
+  }
+  if (sisters !== undefined) {
+    const parents = [
+      ...new Set(
+        [...found.value.values()]
+          .map((issue) => record(issue.fields['parent'])?.['key'])
+          .filter((key): key is string => typeof key === 'string' && ISSUE_KEY.test(key)),
+      ),
+    ];
+    const read = await childrenOf(client, parents, fields, sisterFilter(sisters));
+    if (!read.ok) return jiraFailed(read.error);
+    if (read.value === 'too many') {
+      return refused(
+        narrow(
+          `found more than ${count(MAX_CHILDREN)} sisters under ` +
+            `${parents.length === 1 ? '1 parent' : `${count(parents.length)} parents`}`,
+        ),
+      );
+    }
+    // A row's own issue comes back among its parent's children when it has the type asked for.
+    // It keeps what bulkfetch read, which Jira answers from the issue itself, while a search
+    // answers from an index that can lag behind it.
+    const tableIssues = new Set(table.rows.map(keyOf));
+    const rowKeysNow = new Set(table.rows.map((row) => row.key));
+    for (const sister of read.value) {
+      if (issues.has(sister.key)) continue;
+      // A row keyed by this issue that by= reads another issue for is not this sister's row:
+      // adding the sister would give two rows one key.
+      if (rowKeysNow.has(sister.key) && !tableIssues.has(sister.key)) continue;
+      issues.set(sister.key, sister);
+    }
   }
 
   const ordered = [...issues.values()];
@@ -261,6 +297,13 @@ interface RefreshArguments {
   readonly children: boolean;
   /** What every column this step writes starts with; empty without `prefix=`. */
   readonly prefix: string;
+  /** The sisters to add: their issue type, and a JQL clause they also meet. */
+  readonly sisters: SisterFilter | undefined;
+}
+
+interface SisterFilter {
+  readonly issueType: string;
+  readonly jql: string | undefined;
 }
 
 function readArguments(request: TransformRequest): RefreshArguments | Diagnostic {
@@ -294,12 +337,36 @@ function readArguments(request: TransformRequest): RefreshArguments | Diagnostic
         'first, such as jira_',
     );
   }
+  const sisterType = request.arguments['sisters'];
+  const sisterJql = request.arguments['sisters-jql'];
+  if (sisterType !== undefined && String(sisterType).trim() === '') {
+    return problem('sisters= is empty; name the issue type of the sisters, such as COPYWRITER');
+  }
+  if (sisterJql !== undefined && sisterType === undefined) {
+    return problem('sisters-jql= narrows sisters=; name the issue type with sisters= too');
+  }
+  if (sisterJql !== undefined && String(sisterJql).trim() === '') {
+    return problem('sisters-jql= is empty; write a JQL clause, or leave it out');
+  }
   return {
     by,
     only,
     children: request.arguments['children'] === true,
     prefix: prefix === undefined ? '' : String(prefix).trim(),
+    sisters:
+      sisterType === undefined
+        ? undefined
+        : {
+            issueType: String(sisterType).trim(),
+            jql: sisterJql === undefined ? undefined : String(sisterJql).trim(),
+          },
   };
+}
+
+/** What a sisters search adds after `parent in (...)`: the type, quoted, and the clause. */
+function sisterFilter({ issueType, jql }: SisterFilter): string {
+  const quoted = `"${issueType.replace(/["\\]/g, (character) => '\\' + character)}"`;
+  return ` AND issuetype = ${quoted}${jql === undefined ? '' : ` AND (${jql})`}`;
 }
 
 /**
@@ -341,15 +408,20 @@ async function fetchIssues(
   return jiraOk(found);
 }
 
-/** Every child of the parents, by `parent in (...)`, or `'too many'` past {@link MAX_CHILDREN}. */
+/**
+ * Every child of the parents that `filter` (JQL after `parent in (...)`, or empty) keeps, by
+ * `parent in (...)` a hundred parents at a time, or `'too many'` past {@link MAX_CHILDREN}.
+ */
 async function childrenOf(
   client: JiraClient,
   parents: readonly string[],
   fields: readonly string[],
+  filter: string,
 ): Promise<JiraResult<readonly PulledIssue[] | 'too many'>> {
   const children: PulledIssue[] = [];
   for (let start = 0; start < parents.length; start += PARENTS_PER_SEARCH) {
-    const jql = `parent in (${parents.slice(start, start + PARENTS_PER_SEARCH).join(', ')}) ORDER BY key ASC`;
+    const batch = parents.slice(start, start + PARENTS_PER_SEARCH).join(', ');
+    const jql = `parent in (${batch})${filter} ORDER BY key ASC`;
     let token: string | undefined;
     for (;;) {
       const page = await searchPage(client, jql, fields, token);

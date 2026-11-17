@@ -186,6 +186,7 @@ issue with what Jira holds now, in the same columns `jira.pull` answers.
 
 ```
 jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text>]
+             [sisters=<issue type> [sisters-jql=<clause>]]
 ```
 
 | Argument        | What it does                                                                       |
@@ -194,6 +195,8 @@ jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text
 | `only=`         | refreshes only the rows where this boolean column is true, such as `recall`'s mark |
 | `children=true` | adds every child of the refreshed issues, so `rollup` sees them all                |
 | `prefix=`       | writes every Jira column under this prefix, such as `jira_status` for `jira_`      |
+| `sisters=`      | adds the issues of this type under each refreshed issue's parent, as rows          |
+| `sisters-jql=`  | keeps only the sisters this JQL clause also matches, such as `status != Done`      |
 
 - **Without `prefix=`, a column of the same name is overwritten**: a sheet's own `status`
   column takes Jira's status. With `prefix=jira_`, the step writes `jira_key`, `jira_status`,
@@ -211,7 +214,30 @@ jira.refresh [by=<column>] [only=<boolean column>] [children=true] [prefix=<text
   columns show where it is now.
 - A child already in the table is updated in place; a new one is added. Every refreshed row's
   provenance is `{source: "jira.refresh", id: <key>, fetchedAt}`.
+- **`sisters=` adds a row for each issue of that type under the parent of a refreshed
+  issue**, so a step after it can pair each row with a sister, as below. The sisters of every
+  row come from one search per hundred parents, `parent in (...) AND issuetype = "<type>"`,
+  with `sisters-jql=` added in parentheses; never one search per row. A row's own issue is
+  never its own sister and keeps what was read for it; a sister already in the table is
+  updated in place, like a child. The ceiling is the one children have, 5,000.
 - It always reads Jira; it uses no cache.
+
+### The sister beside each row
+
+A recipe that brings design tasks can find, for each one, the copy task under the same
+parent:
+
+```
+jira.pull jql="project = EX AND issuetype = DESIGN"
+jira.refresh sisters=COPYWRITER
+nearest copy within=parent_key among="issuetype = COPYWRITER" by=words(summary) stopwords=the,a bring=key,description_urls
+where issuetype != COPYWRITER
+```
+
+`jira.refresh sisters=COPYWRITER` adds the copy tasks as rows. Tyto's `nearest` gives each
+row the most similar other row of its parent that is a copy task, as `copy_key` and
+`copy_description_urls` (the only one, when there is one). `where` then drops the copy rows,
+so the steps after it see one row per design.
 
 ## `jira.transition`
 
@@ -430,6 +456,7 @@ and reads Jira.
 | Issues per search page         | 50; the host asks for each page in its own call             |
 | Issues per `jira.refresh` step | 1,000                                                       |
 | Children per `jira.refresh`    | 5,000                                                       |
+| Sisters per `jira.refresh`     | 5,000                                                       |
 | Time per `jira.refresh` step   | 25 s, under the host's 30 s for one call                    |
 | Retries on 429 and 503         | 3, waiting 1, 2 and 4 s, or Jira's `Retry-After` up to 30 s |
 | Cache entry                    | 32 MiB; a larger page is read live and not stored           |

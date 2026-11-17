@@ -89,9 +89,14 @@ type Issue = Readonly<Record<string, unknown>>;
 /**
  * Answers `bulkfetch` from the issues it holds, by key; `moved` answers an old key as the issue
  * it became, and any other key comes back in `issueErrors`. Children are searched by
- * `parent in (...)`.
+ * `parent in (...)`, and optionally an issue type, over `searched` when given: what Jira's
+ * search index holds, which can lag behind the issues themselves.
  */
-function jiraOf(issues: readonly Issue[], moved: Readonly<Record<string, Issue>> = {}): Route {
+function jiraOf(
+  issues: readonly Issue[],
+  moved: Readonly<Record<string, Issue>> = {},
+  searched?: readonly Issue[],
+): Route {
   const byKey = new Map(issues.map((each) => [each['key'] as string, each]));
   return (call: JiraCall) => {
     if (call.method === 'POST' && call.path === BULK) {
@@ -113,13 +118,26 @@ function jiraOf(issues: readonly Issue[], moved: Readonly<Record<string, Issue>>
     }
     if (call.method === 'POST' && call.path === SEARCH) {
       const jql = (call.body as { jql: string }).jql;
-      const parents = /^parent in \(([^)]*)\) ORDER BY key ASC$/.exec(jql)?.[1]?.split(', ') ?? [];
+      // The clause after the type is Jira's to read; the fake checks only parent and type.
+      const asked =
+        /^parent in \(([^)]*)\)(?: AND issuetype = "([^"]*)")?(?: AND \(.*\))? ORDER BY key ASC$/.exec(
+          jql,
+        );
+      const parents = asked?.[1]?.split(', ') ?? [];
+      const type = asked?.[2];
       return response(
         200,
         page(
-          issues.filter((each) => {
-            const parent = (each['fields'] as { parent?: { key?: string } | null }).parent;
-            return parent?.key !== undefined && parents.includes(parent.key);
+          (searched ?? issues).filter((each) => {
+            const fields = each['fields'] as {
+              parent?: { key?: string } | null;
+              issuetype?: { name?: string };
+            };
+            return (
+              fields.parent?.key !== undefined &&
+              parents.includes(fields.parent.key) &&
+              (type === undefined || fields.issuetype?.name === type)
+            );
           }),
         ),
       );
@@ -314,6 +332,129 @@ describe('jira.refresh rows', () => {
     expect(jira.calls.filter((call) => call.path === SEARCH).map((call) => call.body)).toEqual([
       expect.objectContaining({ jql: 'parent in (EX-1) ORDER BY key ASC' }),
     ]);
+  });
+});
+
+describe('jira.refresh sisters=', () => {
+  /** Under parent EX-1, two designs and a copy; under EX-2, one design and nothing else. */
+  const family = (): Issue[] => [
+    issue(1, { summary: 'Campaign' }),
+    issue(10, { parent: { key: 'EX-1' }, issuetype: { name: 'DESIGN' } }),
+    issue(11, { parent: { key: 'EX-1' }, issuetype: { name: 'DESIGN' } }),
+    issue(12, {
+      parent: { key: 'EX-1' },
+      issuetype: { name: 'COPYWRITER' },
+      description: adf('copy', 'https://docs.example.com/copy'),
+    }),
+    issue(2, { summary: 'Other campaign' }),
+    issue(20, { parent: { key: 'EX-2' }, issuetype: { name: 'DESIGN' } }),
+  ];
+
+  it('adds the one copy sister of two designs once, and none to a design without one', async () => {
+    const jira = await site([jiraOf(family())]);
+    const answer = await run(jira, 'jira.refresh sisters=COPYWRITER', {
+      input: sheet(['EX-10', 'EX-11', 'EX-20']),
+    });
+    expect(answer.diagnostics).toEqual([]);
+    expect(
+      answer.table?.rows.map((row) => [row.key, row.values['issuetype'], row.values['parent_key']]),
+    ).toEqual([
+      ['EX-10', 'DESIGN', 'EX-1'],
+      ['EX-11', 'DESIGN', 'EX-1'],
+      ['EX-20', 'DESIGN', 'EX-2'],
+      ['EX-12', 'COPYWRITER', 'EX-1'],
+    ]);
+    expect(answer.table?.rows[3]?.values).toMatchObject({
+      description_urls: ['https://docs.example.com/copy'],
+      note: null,
+    });
+    expect(answer.table?.rows[3]?.provenance).toMatchObject({
+      source: 'jira.refresh',
+      id: 'EX-12',
+    });
+  });
+
+  it('asks one search for every parent, with the type quoted', async () => {
+    const jira = await site([jiraOf(family())]);
+    await run(jira, 'jira.refresh sisters=COPYWRITER', {
+      input: sheet(['EX-10', 'EX-11', 'EX-20']),
+    });
+    expect(jira.calls.filter((call) => call.path === SEARCH).map((call) => call.body)).toEqual([
+      expect.objectContaining({
+        jql: 'parent in (EX-1, EX-2) AND issuetype = "COPYWRITER" ORDER BY key ASC',
+      }),
+    ]);
+  });
+
+  it('adds sisters-jql= to the search in parentheses', async () => {
+    const jira = await site([jiraOf(family())]);
+    const answer = await run(
+      jira,
+      'jira.refresh sisters=COPYWRITER sisters-jql="status != Cancelled"',
+      { input: sheet(['EX-10']) },
+    );
+    expect(answer.diagnostics).toEqual([]);
+    expect(jira.calls.filter((call) => call.path === SEARCH).map((call) => call.body)).toEqual([
+      expect.objectContaining({
+        jql:
+          'parent in (EX-1) AND issuetype = "COPYWRITER" AND (status != Cancelled) ' +
+          'ORDER BY key ASC',
+      }),
+    ]);
+  });
+
+  it('never brings back the own issue of a row as its sister, and keeps what bulkfetch read', async () => {
+    // The search index still holds an older summary of EX-10, which has the type asked for.
+    const stale = family().map((each) =>
+      each['key'] === 'EX-10'
+        ? { ...each, fields: { ...(each['fields'] as object), summary: 'indexed' } }
+        : each,
+    );
+    const jira = await site([jiraOf(family(), {}, stale)]);
+    const answer = await run(jira, 'jira.refresh sisters=DESIGN', { input: sheet(['EX-10']) });
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.table?.rows.map((row) => [row.key, row.values['summary']])).toEqual([
+      ['EX-10', 'Issue 10'],
+      ['EX-11', 'Issue 11'],
+    ]);
+  });
+
+  it('updates a sister that is already a row in place', async () => {
+    const jira = await site([jiraOf(family())]);
+    const input = sheet(['EX-10', 'EX-12'], [{ name: 'pick', type: 'boolean', origin: 'sheet' }]);
+    const marked: InputTable = {
+      ...input,
+      rows: input.rows.map((row) => ({
+        ...row,
+        values: { ...row.values, pick: row.key === 'EX-10' },
+      })),
+    };
+    const answer = await run(jira, 'jira.refresh only=pick sisters=COPYWRITER', { input: marked });
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.table?.rows.map((row) => [row.key, row.values['issuetype']])).toEqual([
+      ['EX-10', 'DESIGN'],
+      ['EX-12', 'COPYWRITER'],
+    ]);
+  });
+
+  it('searches nothing when no refreshed issue has a parent', async () => {
+    const jira = await site([jiraOf(family())]);
+    const answer = await run(jira, 'jira.refresh sisters=COPYWRITER', { input: sheet(['EX-1']) });
+    expect(answer.diagnostics).toEqual([]);
+    expect(answer.table?.rows.map((row) => row.key)).toEqual(['EX-1']);
+    expect(jira.calls.filter((call) => call.path === SEARCH)).toEqual([]);
+  });
+
+  it('refuses an empty sisters=, and sisters-jql= without it', async () => {
+    const jira = await site([jiraOf(family())]);
+    const empty = await run(jira, 'jira.refresh sisters=""', { input: sheet(['EX-10']) });
+    expect(empty.diagnostics.map((each) => each.code)).toEqual(['E_RECIPE_ARGUMENTS']);
+    expect(empty.diagnostics[0]?.message).toContain('sisters= is empty');
+    const alone = await run(jira, 'jira.refresh sisters-jql="status = Done"', {
+      input: sheet(['EX-10']),
+    });
+    expect(alone.diagnostics[0]?.message).toContain('name the issue type with sisters= too');
+    expect(jira.calls).toEqual([]);
   });
 });
 
