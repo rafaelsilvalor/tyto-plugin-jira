@@ -176,6 +176,142 @@ describe('jira.assign', () => {
     ]);
   });
 
+  it('plans only the rows only= chose, by a boolean or a text column, and writes nothing else', async () => {
+    const issues = state({ 'EX-1': null, 'EX-2': null, 'EX-3': null, 'EX-4': null });
+    const jira = await site([jiraWrites(issues)]);
+    const columns = [
+      ...OWNER,
+      { name: 'push', type: 'boolean', origin: 'sheet' },
+      { name: 'why', type: 'text', origin: 'sheet' },
+    ] as const;
+    const table = pulled(
+      [
+        ['EX-1', 'To Do'],
+        ['EX-2', 'To Do'],
+        ['EX-3', 'To Do'],
+        ['EX-4', 'To Do'],
+      ],
+      [...columns],
+      {
+        'EX-1': { owner: ALICE.accountId, push: true, why: 'sheet' },
+        'EX-2': { owner: BRUNO.accountId, push: false, why: '' },
+        'EX-3': { owner: '', push: null, why: '  ' },
+        'EX-4': { owner: 'none', push: false, why: null },
+      },
+    );
+    for (const only of ['push', 'why']) {
+      const answer = await planAndApply(jira, `jira.assign to=owner only=${only}`, table);
+      expect(answer.diagnostics).toEqual([]);
+      expect(answer.plan?.operations.map((each) => each.rowKey)).toEqual(['EX-1']);
+      expect(answer.applied).toEqual([
+        only === 'push'
+          ? { status: 'applied' }
+          : { status: 'applied', reason: 'already assigned to Person 0002; nothing written' },
+      ]);
+      expect(callsAfter(jira, answer.planCalls).filter((call) => call.startsWith('PUT'))).toEqual(
+        only === 'push' ? ['PUT /rest/api/3/issue/EX-1/assignee'] : [],
+      );
+    }
+    expect([...issues.values()].map((each) => each.assignee?.accountId ?? null)).toEqual([
+      ALICE.accountId,
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it('refuses an only= that names no column of the table', async () => {
+    const jira = await site([]);
+    const answer = await planAndApply(
+      jira,
+      'jira.assign to=me only=pushes',
+      pulled([['EX-1', 'To Do']]),
+    );
+    expect(answer.diagnostics).toEqual([
+      {
+        code: 'E_RECIPE_ARGUMENTS',
+        message: "'jira.assign' only= names 'pushes', which is not a column of the table.",
+      },
+    ]);
+    expect(answer.plan).toBeUndefined();
+  });
+
+  it('unassigns the issue of a to= cell holding none, and still fails an empty one', async () => {
+    const issues = state({ 'EX-1': ALICE, 'EX-2': BRUNO, 'EX-3': ALICE });
+    const jira = await site([jiraWrites(issues)]);
+    const answer = await planAndApply(
+      jira,
+      'jira.assign to=owner',
+      pulled(
+        [
+          ['EX-1', 'To Do', 'Alice'],
+          ['EX-2', 'To Do', 'Bruno'],
+          ['EX-3', 'To Do', 'Alice'],
+        ],
+        [...OWNER],
+        { 'EX-1': { owner: 'none' }, 'EX-2': { owner: ' None ' }, 'EX-3': { owner: '' } },
+      ),
+    );
+    expect(
+      answer.plan?.operations.map(({ description, payload }) => ({ description, payload })),
+    ).toEqual([
+      { description: 'EX-1: Alice → unassigned', payload: { k: 'EX-1', f: 'Alice', t: null } },
+      { description: 'EX-2: Bruno → unassigned', payload: { k: 'EX-2', f: 'Bruno', t: null } },
+      {
+        description: 'EX-3: assign (will fail: E_JIRA_PLAN: EX-3 has no account id in owner)',
+        payload: { x: 'E_JIRA_PLAN: EX-3 has no account id in owner' },
+      },
+    ]);
+    expect(answer.applied).toEqual([
+      { status: 'applied' },
+      { status: 'applied' },
+      { status: 'failed', reason: 'E_JIRA_PLAN: EX-3 has no account id in owner' },
+    ]);
+    expect(jira.calls.filter((call) => call.method === 'PUT')).toMatchObject([
+      { path: '/rest/api/3/issue/EX-1/assignee', body: { accountId: null } },
+      { path: '/rest/api/3/issue/EX-2/assignee', body: { accountId: null } },
+    ]);
+    expect(issues.get('EX-3')?.assignee).toEqual(ALICE);
+  });
+
+  it('fails an issue reassigned since the plan on a table only= filtered', async () => {
+    const issues = state({ 'EX-1': BRUNO, 'EX-2': ALICE });
+    const jira = await site([jiraWrites(issues)]);
+    const answer = await planAndApply(
+      jira,
+      'jira.assign to=owner only=push',
+      pulled(
+        [
+          ['EX-1', 'To Do', 'Bruno'],
+          ['EX-2', 'To Do', 'Alice'],
+        ],
+        [...OWNER, { name: 'push', type: 'boolean', origin: 'sheet' }],
+        {
+          'EX-1': { owner: BRUNO.accountId, push: false },
+          'EX-2': { owner: 'none', push: true },
+        },
+      ),
+      () => {
+        (issues.get('EX-2') as FakeIssue).assignee = {
+          accountId: '557058:cccccccc-0000-4000-8000-000000000003',
+          displayName: 'Carla',
+        };
+      },
+    );
+    expect(answer.plan?.operations.map((each) => each.payload)).toEqual([
+      { k: 'EX-2', f: 'Alice', t: null },
+    ]);
+    expect(answer.applied).toEqual([
+      {
+        status: 'failed',
+        reason:
+          'E_JIRA_MOVED: EX-2 was assigned to Alice when planned and is assigned to Carla now; ' +
+          'run the cell again',
+      },
+    ]);
+    expect(jira.calls.some((call) => call.method === 'PUT')).toBe(false);
+  });
+
   it('keeps the token out of a failed PUT the site echoed it in', async () => {
     const echo: Route = (call) =>
       call.method === 'PUT' ? response(400, { errors: { assignee: `no ${TOKEN}` } }) : undefined;

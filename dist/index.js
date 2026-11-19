@@ -128,35 +128,6 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
 }
 
-// src/diagnostics.ts
-var VERB_ID = "jira.pull";
-var REFRESH_VERB_ID = "jira.refresh";
-var TRANSITION_VERB_ID = "jira.transition";
-var ASSIGN_VERB_ID = "jira.assign";
-var SET_VERB_ID = "jira.set";
-var COMMENT_VERB_ID = "jira.comment";
-var CREATE_VERB_ID = "jira.create";
-function verbFailed(error, verb = VERB_ID) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_VERB",
-    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
-  };
-}
-function argumentsProblem(problem7, verb = VERB_ID) {
-  return {
-    severity: "error",
-    code: "E_RECIPE_ARGUMENTS",
-    message: `'${verb}' ${withoutFinalStop(problem7)}.`
-  };
-}
-function failed(diagnostic) {
-  return { ok: false, error: [diagnostic] };
-}
-function withoutFinalStop(text2) {
-  return text2.trim().replace(/\.+$/, "");
-}
-
 // src/columns.ts
 var ORIGIN = "jira";
 var FIXED_COLUMNS = [
@@ -273,6 +244,195 @@ function text(value) {
 }
 function unique(values) {
   return [...new Set(values)];
+}
+
+// src/fields.ts
+var COLUMN_NAME = /^[a-z][a-z0-9_]*$/;
+var FIXED_NAMES = new Set(FIXED_COLUMNS.map((column) => column.name));
+var MAPPED_TYPES = /* @__PURE__ */ new Set(["text", "number", "date", "datetime", "list"]);
+var FIELD_CATALOGUE = "/rest/api/3/field";
+function mappedFields(section) {
+  const fields = record(section)?.["fields"];
+  if (fields === void 0 || fields === null) return jiraOk([]);
+  const written = record(fields);
+  if (written === void 0) {
+    return configError(
+      'fields in the jira section of .tyto/project.json is not an object of column names and field ids, such as {"story_points": "customfield_10016"}'
+    );
+  }
+  const mapped = [];
+  for (const [column, id] of Object.entries(written)) {
+    if (!COLUMN_NAME.test(column)) {
+      return configError(
+        `fields names a column '${column}'; a column name is lower case letters, digits and _, starting with a letter, such as story_points`
+      );
+    }
+    if (FIXED_NAMES.has(column)) {
+      return configError(
+        `fields names a column '${column}', which every pull already answers; choose another name`
+      );
+    }
+    if (typeof id !== "string" || id.trim() === "") {
+      return configError(
+        `fields maps ${column} to ${JSON.stringify(id)}, which is not a field id, such as customfield_10016`
+      );
+    }
+    mapped.push({ column, id: id.trim() });
+  }
+  return jiraOk(mapped);
+}
+async function mappedTypes(client, mapped) {
+  if (mapped.length === 0) return jiraOk({});
+  const answer = await client.get(FIELD_CATALOGUE);
+  if (!answer.ok) return answer;
+  if (!Array.isArray(answer.value)) {
+    return jiraError("E_JIRA_RESPONSE", `GET ${FIELD_CATALOGUE} answered no list of fields.`);
+  }
+  const catalogue = answer.value.map((field) => record(field)).filter((field) => !!field);
+  const types = {};
+  for (const { column, id } of mapped) {
+    const field = catalogue.find((candidate) => candidate["id"] === id);
+    if (field === void 0) return configError(unknownField(column, id, catalogue));
+    types[column] = typeOfSchema(record(field["schema"])?.["type"]);
+  }
+  return jiraOk(types);
+}
+function unknownField(column, written, catalogue) {
+  const lowered = written.toLowerCase();
+  const named2 = catalogue.filter((field) => typeof field["name"] === "string" && field["name"].toLowerCase() === lowered).map((field) => field["id"]).filter((id) => typeof id === "string");
+  if (named2.length === 0) {
+    return `fields maps ${column} to '${written}', and this site has no field with that id`;
+  }
+  return `fields maps ${column} to '${written}', which is a field's name, not its id; write ` + named2.join(" or ");
+}
+function typeOfSchema(type) {
+  switch (type) {
+    case "number":
+      return "number";
+    case "date":
+      return "date";
+    case "datetime":
+      return "datetime";
+    case "array":
+      return "list";
+    default:
+      return "text";
+  }
+}
+function sameColumns(types, mapped) {
+  const names = Object.keys(types);
+  return names.length === mapped.length && mapped.every(({ column }) => MAPPED_TYPES.has(types[column] ?? "")) && names.every((name) => mapped.some(({ column }) => column === name));
+}
+function mappedColumns(mapped, types) {
+  return mapped.map(({ column }) => ({
+    name: column,
+    type: types[column] ?? "text",
+    origin: ORIGIN
+  }));
+}
+function mappedValues(fields, key, mapped, types) {
+  const values = {};
+  for (const { column, id } of mapped) {
+    const value = cellOf(types[column] ?? "text", fields[id], key, column);
+    if (!value.ok) return value;
+    values[column] = value.value;
+  }
+  return jiraOk(values);
+}
+var JIRA_DATE = /^\d{4}-\d{2}-\d{2}$/;
+function cellOf(type, value, key, column) {
+  if (type === "list") {
+    if (value === void 0 || value === null) return jiraOk([]);
+    return Array.isArray(value) ? jiraOk(value.map((item) => typeof item === "number" ? item : textOf(item))) : jiraOk([textOf(value)]);
+  }
+  if (value === void 0 || value === null) return jiraOk(null);
+  switch (type) {
+    case "number":
+      if (typeof value === "number" && Number.isFinite(value)) return jiraOk(value);
+      return notA(key, column, value, "number");
+    case "date":
+      if (typeof value === "string" && JIRA_DATE.test(value)) return jiraOk(value);
+      return notA(key, column, value, "date, such as 2026-10-01");
+    case "datetime":
+      return isoUtc(value, key, column);
+    case "text":
+      return jiraOk(textOf(value));
+  }
+}
+function notA(key, column, value, what) {
+  return jiraError(
+    "E_JIRA_RESPONSE",
+    `${key}'s ${column} is ${JSON.stringify(value)}, which is not a ${what}.`
+  );
+}
+function textOf(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const object = record(value);
+  if (object?.["type"] === "doc") return documentText(object);
+  for (const name of ["value", "name", "displayName"]) {
+    const shown2 = object?.[name];
+    if (typeof shown2 === "string") return shown2;
+  }
+  return JSON.stringify(value) ?? "";
+}
+function documentText(document) {
+  const inline = (node) => {
+    const current = record(node);
+    if (current === void 0) return "";
+    if (typeof current["text"] === "string") return current["text"];
+    if (current["type"] === "hardBreak") return "\n";
+    return Array.isArray(current["content"]) ? current["content"].map(inline).join("") : "";
+  };
+  const blocks = Array.isArray(document["content"]) ? document["content"] : [];
+  return blocks.map(inline).filter((line) => line !== "").join("\n");
+}
+function projected(value) {
+  if (value === void 0 || value === null || value === "") return null;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    return value.map((item) => typeof item === "number" ? item : textOf(item));
+  }
+  if (typeof value === "number") return value;
+  return textOf(value);
+}
+function chosenBy(row, column) {
+  const cell = row.values[column.name] ?? null;
+  if (column.type === "boolean") return cell === true;
+  const shown2 = projected(cell);
+  return shown2 !== null && (typeof shown2 !== "string" || shown2.trim() !== "");
+}
+function configError(message) {
+  return jiraError("E_JIRA_CONFIG", `${message}.`);
+}
+
+// src/diagnostics.ts
+var VERB_ID = "jira.pull";
+var REFRESH_VERB_ID = "jira.refresh";
+var TRANSITION_VERB_ID = "jira.transition";
+var ASSIGN_VERB_ID = "jira.assign";
+var SET_VERB_ID = "jira.set";
+var COMMENT_VERB_ID = "jira.comment";
+var CREATE_VERB_ID = "jira.create";
+function verbFailed(error, verb = VERB_ID) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_VERB",
+    message: `'${verb}' failed: ${withoutFinalStop(describeJiraError(error))}.`
+  };
+}
+function argumentsProblem(problem7, verb = VERB_ID) {
+  return {
+    severity: "error",
+    code: "E_RECIPE_ARGUMENTS",
+    message: `'${verb}' ${withoutFinalStop(problem7)}.`
+  };
+}
+function failed(diagnostic) {
+  return { ok: false, error: [diagnostic] };
+}
+function withoutFinalStop(text2) {
+  return text2.trim().replace(/\.+$/, "");
 }
 
 // tyto-plugin.json
@@ -839,166 +999,6 @@ function replayingClient(raw) {
   };
 }
 
-// src/fields.ts
-var COLUMN_NAME = /^[a-z][a-z0-9_]*$/;
-var FIXED_NAMES = new Set(FIXED_COLUMNS.map((column) => column.name));
-var MAPPED_TYPES = /* @__PURE__ */ new Set(["text", "number", "date", "datetime", "list"]);
-var FIELD_CATALOGUE = "/rest/api/3/field";
-function mappedFields(section) {
-  const fields = record(section)?.["fields"];
-  if (fields === void 0 || fields === null) return jiraOk([]);
-  const written = record(fields);
-  if (written === void 0) {
-    return configError(
-      'fields in the jira section of .tyto/project.json is not an object of column names and field ids, such as {"story_points": "customfield_10016"}'
-    );
-  }
-  const mapped = [];
-  for (const [column, id] of Object.entries(written)) {
-    if (!COLUMN_NAME.test(column)) {
-      return configError(
-        `fields names a column '${column}'; a column name is lower case letters, digits and _, starting with a letter, such as story_points`
-      );
-    }
-    if (FIXED_NAMES.has(column)) {
-      return configError(
-        `fields names a column '${column}', which every pull already answers; choose another name`
-      );
-    }
-    if (typeof id !== "string" || id.trim() === "") {
-      return configError(
-        `fields maps ${column} to ${JSON.stringify(id)}, which is not a field id, such as customfield_10016`
-      );
-    }
-    mapped.push({ column, id: id.trim() });
-  }
-  return jiraOk(mapped);
-}
-async function mappedTypes(client, mapped) {
-  if (mapped.length === 0) return jiraOk({});
-  const answer = await client.get(FIELD_CATALOGUE);
-  if (!answer.ok) return answer;
-  if (!Array.isArray(answer.value)) {
-    return jiraError("E_JIRA_RESPONSE", `GET ${FIELD_CATALOGUE} answered no list of fields.`);
-  }
-  const catalogue = answer.value.map((field) => record(field)).filter((field) => !!field);
-  const types = {};
-  for (const { column, id } of mapped) {
-    const field = catalogue.find((candidate) => candidate["id"] === id);
-    if (field === void 0) return configError(unknownField(column, id, catalogue));
-    types[column] = typeOfSchema(record(field["schema"])?.["type"]);
-  }
-  return jiraOk(types);
-}
-function unknownField(column, written, catalogue) {
-  const lowered = written.toLowerCase();
-  const named2 = catalogue.filter((field) => typeof field["name"] === "string" && field["name"].toLowerCase() === lowered).map((field) => field["id"]).filter((id) => typeof id === "string");
-  if (named2.length === 0) {
-    return `fields maps ${column} to '${written}', and this site has no field with that id`;
-  }
-  return `fields maps ${column} to '${written}', which is a field's name, not its id; write ` + named2.join(" or ");
-}
-function typeOfSchema(type) {
-  switch (type) {
-    case "number":
-      return "number";
-    case "date":
-      return "date";
-    case "datetime":
-      return "datetime";
-    case "array":
-      return "list";
-    default:
-      return "text";
-  }
-}
-function sameColumns(types, mapped) {
-  const names = Object.keys(types);
-  return names.length === mapped.length && mapped.every(({ column }) => MAPPED_TYPES.has(types[column] ?? "")) && names.every((name) => mapped.some(({ column }) => column === name));
-}
-function mappedColumns(mapped, types) {
-  return mapped.map(({ column }) => ({
-    name: column,
-    type: types[column] ?? "text",
-    origin: ORIGIN
-  }));
-}
-function mappedValues(fields, key, mapped, types) {
-  const values = {};
-  for (const { column, id } of mapped) {
-    const value = cellOf(types[column] ?? "text", fields[id], key, column);
-    if (!value.ok) return value;
-    values[column] = value.value;
-  }
-  return jiraOk(values);
-}
-var JIRA_DATE = /^\d{4}-\d{2}-\d{2}$/;
-function cellOf(type, value, key, column) {
-  if (type === "list") {
-    if (value === void 0 || value === null) return jiraOk([]);
-    return Array.isArray(value) ? jiraOk(value.map((item) => typeof item === "number" ? item : textOf(item))) : jiraOk([textOf(value)]);
-  }
-  if (value === void 0 || value === null) return jiraOk(null);
-  switch (type) {
-    case "number":
-      if (typeof value === "number" && Number.isFinite(value)) return jiraOk(value);
-      return notA(key, column, value, "number");
-    case "date":
-      if (typeof value === "string" && JIRA_DATE.test(value)) return jiraOk(value);
-      return notA(key, column, value, "date, such as 2026-10-01");
-    case "datetime":
-      return isoUtc(value, key, column);
-    case "text":
-      return jiraOk(textOf(value));
-  }
-}
-function notA(key, column, value, what) {
-  return jiraError(
-    "E_JIRA_RESPONSE",
-    `${key}'s ${column} is ${JSON.stringify(value)}, which is not a ${what}.`
-  );
-}
-function textOf(value) {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  const object = record(value);
-  if (object?.["type"] === "doc") return documentText(object);
-  for (const name of ["value", "name", "displayName"]) {
-    const shown2 = object?.[name];
-    if (typeof shown2 === "string") return shown2;
-  }
-  return JSON.stringify(value) ?? "";
-}
-function documentText(document) {
-  const inline = (node) => {
-    const current = record(node);
-    if (current === void 0) return "";
-    if (typeof current["text"] === "string") return current["text"];
-    if (current["type"] === "hardBreak") return "\n";
-    return Array.isArray(current["content"]) ? current["content"].map(inline).join("") : "";
-  };
-  const blocks = Array.isArray(document["content"]) ? document["content"] : [];
-  return blocks.map(inline).filter((line) => line !== "").join("\n");
-}
-function projected(value) {
-  if (value === void 0 || value === null || value === "") return null;
-  if (Array.isArray(value)) {
-    if (value.length === 0) return null;
-    return value.map((item) => typeof item === "number" ? item : textOf(item));
-  }
-  if (typeof value === "number") return value;
-  return textOf(value);
-}
-function chosenBy(row, column) {
-  const cell = row.values[column.name] ?? null;
-  if (column.type === "boolean") return cell === true;
-  const shown2 = projected(cell);
-  return shown2 !== null && (typeof shown2 !== "string" || shown2.trim() !== "");
-}
-function configError(message) {
-  return jiraError("E_JIRA_CONFIG", `${message}.`);
-}
-
 // src/rows.ts
 async function readIssues(client, issues) {
   const parents = await parentDescriptions(client, issues);
@@ -1382,7 +1382,10 @@ var wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, millis
 
 // src/assign.ts
 var ASSIGN_WRITE = "assign";
-var ARGUMENTS2 = [{ name: "to", type: "text", required: true }];
+var ARGUMENTS2 = [
+  { name: "to", type: "text", required: true },
+  { name: "only", type: "text" }
+];
 var ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/;
 function assignVerb(host, clock = systemClock) {
   return {
@@ -1416,11 +1419,19 @@ async function planAssignments(host, request) {
     }
     target = { kind: "column", column };
   }
+  const onlyName = request.arguments["only"];
+  const only = onlyName === void 0 ? void 0 : columnNamed(table, String(onlyName).trim());
+  if (onlyName !== void 0 && only === void 0) {
+    return planRefused(
+      problem(`only= names '${String(onlyName)}', which is not a column of the table`)
+    );
+  }
   const assignee = columnNamed(table, "assignee");
   const config = await resolveJiraConfig(host, request.section);
   if (!config.ok) return planRefused(verbFailed(config.error, ASSIGN_VERB_ID));
   const operations = [];
   for (const row of table.rows) {
+    if (only !== void 0 && !chosenBy(row, only)) continue;
     const key = issueKeyOf(row) ?? row.key;
     const fail = (description, reason) => {
       operations.push(plannedFailure(ASSIGN_WRITE, row.key, description, reason));
@@ -1445,7 +1456,9 @@ async function planAssignments(host, request) {
       );
       continue;
     }
-    if (target.kind === "none") {
+    const cell = target.kind === "column" ? row.values[target.column.name] : void 0;
+    const unassigns = typeof cell === "string" && cell.trim().toLowerCase() === "none";
+    if (target.kind === "none" || unassigns) {
       operations.push(
         plannedOperation(ASSIGN_WRITE, row.key, `${key}: ${before}unassigned`, {
           k: key,
@@ -1455,8 +1468,7 @@ async function planAssignments(host, request) {
       );
       continue;
     }
-    const value = row.values[target.column.name];
-    const accountId = typeof value === "string" ? value.trim() : "";
+    const accountId = typeof cell === "string" ? cell.trim() : "";
     if (accountId === "") {
       fail(`${key}: assign`, `E_JIRA_PLAN: ${key} has no account id in ${target.column.name}`);
       continue;

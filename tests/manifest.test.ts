@@ -109,7 +109,14 @@ describe('activate', () => {
           { name: 'from-column', type: 'text' },
         ],
       ],
-      ['jira.assign', 'action', [{ name: 'to', type: 'text', required: true }]],
+      [
+        'jira.assign',
+        'action',
+        [
+          { name: 'to', type: 'text', required: true },
+          { name: 'only', type: 'text' },
+        ],
+      ],
       [
         'jira.set',
         'action',
