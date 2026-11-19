@@ -278,12 +278,20 @@ jira.transition (to=<status> | to-column=<column>) [workflow=<name> | workflow-c
 An action: it assigns each row's issue.
 
 ```
-jira.assign to=<column>|me|none
+jira.assign to=<column>|me|none [only=<column>]
 ```
 
 - `to=<column>` takes the account id in that text column, `me` the token's own account, `none`
   leaves the issue unassigned. There is no lookup by name or email: a cell that is not an
   account id is a planned failure.
+- **A `to=` cell holding `none` unassigns that row's issue** (ignoring case, as `to=none`). An
+  account id spelled `none` is therefore unreachable; Jira's never are.
+- An empty `to=` cell is a planned failure of that row, never an implicit unassign: a cell
+  nobody filled leaves the assignee alone.
+- `only=` plans the rows whose cell in that column is true or holds something, and nothing for
+  the others, as `jira.set`'s does. A two-way sync assigns only the rows a step before it chose
+  to push, and keeps the whole table, so the check below still reads `assignee`.
+- `only=` naming a column the table lacks is refused before a plan.
 - When the table holds `jira.pull`'s `assignee` column, Apply checks the issue is still assigned
   to that person, and fails an issue reassigned since the plan.
 

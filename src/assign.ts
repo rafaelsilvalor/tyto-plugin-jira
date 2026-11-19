@@ -1,6 +1,7 @@
 import type { AppliedBatchOperation, ApplyRequest, RecipeVerbContribution } from '@tyto/plugin-api';
 
 import { resolveJiraConfig } from './config.js';
+import { chosenBy } from './fields.js';
 import {
   ASSIGN_VERB_ID,
   argumentsProblem,
@@ -34,7 +35,10 @@ import {
 
 export const ASSIGN_WRITE = 'assign';
 
-const ARGUMENTS: readonly ArgumentSpec[] = [{ name: 'to', type: 'text', required: true }];
+const ARGUMENTS: readonly ArgumentSpec[] = [
+  { name: 'to', type: 'text', required: true },
+  { name: 'only', type: 'text' },
+];
 
 /**
  * Jira Cloud's account ids: `557058:` and a UUID, or 24 hexadecimal digits, among others. The
@@ -43,13 +47,19 @@ const ARGUMENTS: readonly ArgumentSpec[] = [{ name: 'to', type: 'text', required
 export const ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/;
 
 /**
- * `jira.assign to=<column>|me|none`: assigns each row's issue to the account id its `to=`
- * column holds, to the token's own account, or to nobody, through `PUT /issue/{key}/assignee`.
+ * `jira.assign to=<column>|me|none [only=<column>]`: assigns each row's issue to the account id
+ * its `to=` column holds, to the token's own account, or to nobody, through
+ * `PUT /issue/{key}/assignee`. A `to=` cell holding `none` unassigns that row's issue; an empty
+ * cell stays a planned failure, so a cell nobody filled never unassigns anybody.
  *
  * No lookup by name or email: a recipe that knows a person knows their account id, and a
  * lookup that guesses between two people with one name would write to the wrong one. When the
  * table holds `jira.pull`'s `assignee` column, Apply checks the issue is still assigned to the
  * person it read, and an issue reassigned since the plan fails alone.
+ *
+ * `only=` plans the rows whose cell in that column is true or holds something, as `jira.set`'s
+ * does: a two-way sync assigns only the rows a `decide` step chose to push, and keeps the table
+ * whole so the drift check still reads `assignee`.
  */
 export function assignVerb(
   host: WriteHost,
@@ -93,6 +103,13 @@ export async function planAssignments(host: WriteHost, request: PlanRequest): Pr
     }
     target = { kind: 'column', column };
   }
+  const onlyName = request.arguments['only'];
+  const only = onlyName === undefined ? undefined : columnNamed(table, String(onlyName).trim());
+  if (onlyName !== undefined && only === undefined) {
+    return planRefused(
+      problem(`only= names '${String(onlyName)}', which is not a column of the table`),
+    );
+  }
   const assignee = columnNamed(table, 'assignee');
 
   const config = await resolveJiraConfig(host, request.section);
@@ -100,6 +117,7 @@ export async function planAssignments(host: WriteHost, request: PlanRequest): Pr
 
   const operations: PlannedOperation[] = [];
   for (const row of table.rows) {
+    if (only !== undefined && !chosenBy(row, only)) continue;
     const key = issueKeyOf(row) ?? row.key;
     const fail = (description: string, reason: string): void => {
       operations.push(plannedFailure(ASSIGN_WRITE, row.key, description, reason));
@@ -127,7 +145,9 @@ export async function planAssignments(host: WriteHost, request: PlanRequest): Pr
       );
       continue;
     }
-    if (target.kind === 'none') {
+    const cell = target.kind === 'column' ? row.values[target.column.name] : undefined;
+    const unassigns = typeof cell === 'string' && cell.trim().toLowerCase() === 'none';
+    if (target.kind === 'none' || unassigns) {
       operations.push(
         plannedOperation(ASSIGN_WRITE, row.key, `${key}: ${before}unassigned`, {
           k: key,
@@ -137,8 +157,7 @@ export async function planAssignments(host: WriteHost, request: PlanRequest): Pr
       );
       continue;
     }
-    const value = row.values[target.column.name];
-    const accountId = typeof value === 'string' ? value.trim() : '';
+    const accountId = typeof cell === 'string' ? cell.trim() : '';
     if (accountId === '') {
       fail(`${key}: assign`, `E_JIRA_PLAN: ${key} has no account id in ${target.column.name}`);
       continue;
